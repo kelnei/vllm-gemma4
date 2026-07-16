@@ -107,6 +107,20 @@ python3 bench.py
 
 KV cache capacity is what vLLM reports at startup at `--gpu-memory-utilization 0.92` with each model's maximum context configured (262,144, except 131,072 for E2B/E4B). The headline result: the 26B-A4B MoE decodes ~4x faster than the dense 31B while being close to it in quality, and even edges out the much smaller E4B.
 
+### DGX Spark (GB10)
+
+Same method on a DGX Spark using [docker-compose.spark.yml](docker-compose.spark.yml) (`--gpu-memory-utilization 0.78`, unified memory):
+
+| Model | Single-stream decode | Aggregate, 8 streams | KV cache capacity |
+| --- | --- | --- | --- |
+| gemma-4-31B | 8.9 tok/s | 68 tok/s | 731k tokens |
+| **gemma-4-26B-A4B** (default) | **48.6 tok/s** | **217 tok/s** | 3.3M tokens |
+| gemma-4-12b | 21.5 tok/s | 170 tok/s | 3.0M tokens |
+| gemma-4-E4B | 42.0 tok/s | 343 tok/s | 6.6M tokens |
+| gemma-4-E2B | 78.3 tok/s | 606 tok/s | 19.5M tokens |
+
+The GB10's unified LPDDR5X gives roughly a fifth of the discrete card's memory bandwidth, and decode is bandwidth-bound, so everything scales down accordingly. The same conclusion holds even more strongly here: the dense 31B is not interactive on this hardware (~9 tok/s), while the 26B-A4B MoE stays comfortably usable.
+
 ## Tuning
 
 - `--gpu-memory-utilization 0.92` leaves headroom for CUDA graph capture; pushing it higher can OOM after the KV cache is allocated.
