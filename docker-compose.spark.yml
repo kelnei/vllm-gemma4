@@ -14,10 +14,10 @@
 #   COMPOSE_FILE=docker-compose.spark.yml
 services:
   vllm:
-    # Gemma 4 needs vLLM >= 0.24.0; v0.25.1 adds Gemma 4 sliding-window/FA4
-    # attention fixes and bundles the flashinfer + cutlass-dsl versions the
-    # unsloth NVFP4 cute-DSL W4A4 path requires
-    image: vllm/vllm-openai:v0.25.1
+    # Gemma 4 needs vLLM >= 0.24.0; the Gemma 4 sliding-window/FA4 attention
+    # fixes landed in v0.25.1, and the image bundles the flashinfer +
+    # cutlass-dsl versions the unsloth NVFP4 cute-DSL W4A4 path requires
+    image: vllm/vllm-openai:v0.26.0
     container_name: vllm-gemma4
     restart: unless-stopped
     ipc: host
@@ -26,15 +26,18 @@ services:
     environment:
       - HF_TOKEN=${HF_TOKEN?Set HF_TOKEN in .env or export it}
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      # HF_HOME alone is enough: the hub cache derives as $HF_HOME/hub. Pointing
+      # HUGGINGFACE_HUB_CACHE at the HF_HOME root instead lands weights in
+      # $HF_HOME/models--* rather than $HF_HOME/hub/models--*, so the container
+      # ignores the weights the host already has and re-downloads them.
       - HF_HOME=/root/.cache/huggingface
-      - HUGGINGFACE_HUB_CACHE=/root/.cache/huggingface
     volumes:
       - huggingface_cache:/root/.cache/huggingface
       # persist torch.compile + FlashInfer autotune caches across container
       # recreation: warm start in minutes instead of a full recompile
       - vllm_cache:/root/.cache/vllm
     command:
-      - "--model"
+      # the model is passed positionally; it overrides --model if both are given
       - "unsloth/gemma-4-26B-A4B-it-NVFP4"
       - "--served-model-name"
       - "gemma-4-26b-a4b"
