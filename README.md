@@ -12,7 +12,7 @@ Default model: [unsloth/gemma-4-26B-A4B-it-NVFP4](https://huggingface.co/unsloth
 | [gemma-4-E4B-it-NVFP4](https://huggingface.co/unsloth/gemma-4-E4B-it-NVFP4) | 4B effective | 131,072 | Audio input support |
 | [gemma-4-E2B-it-NVFP4](https://huggingface.co/unsloth/gemma-4-E2B-it-NVFP4) | 2B effective | 131,072 | Audio input support |
 
-All five have been verified with this compose file on an RTX PRO 6000 Blackwell (96 GB) running vLLM v0.26.0 — see [Benchmarks](#benchmarks). Optional [speculative decoding](#enabling-speculative-decoding) adds up to +114% decode on the dense models.
+All five have been verified with this compose file on an RTX PRO 6000 Blackwell (96 GB) and a DGX Spark (GB10), both running vLLM v0.26.0 — see [Benchmarks](#benchmarks). Optional [speculative decoding](#enabling-speculative-decoding) adds up to +118% decode on the dense models.
 
 ## Requirements
 
@@ -91,7 +91,7 @@ Two things to adjust for the E-series variants:
 
 ## Enabling speculative decoding
 
-Off by default, but worth turning on — it is worth up to +114% decode on the dense models. See [Speculative decoding](#speculative-decoding) for the measurements behind these recommendations.
+Off by default, but worth turning on — it is worth up to +118% decode on the dense models, on both the RTX PRO 6000 and the DGX Spark. See [Speculative decoding](#speculative-decoding) for the measurements behind these recommendations.
 
 **DFlash** (recommended for the dense 31B and 12b) needs one extra argument in `docker-compose.yml`:
 
@@ -167,29 +167,95 @@ Both drafters cost KV cache capacity: on the 26B-A4B, 1.95M tokens baseline drop
 
 ### DGX Spark (GB10)
 
-Same method on a DGX Spark using [docker-compose.spark.yml](docker-compose.spark.yml) (`--gpu-memory-utilization 0.78`, unified memory), on vLLM v0.25.1\*:
+Same method on a DGX Spark using [docker-compose.spark.yml](docker-compose.spark.yml) (`--gpu-memory-utilization 0.78`, unified memory), re-measured 2026-07-28 on vLLM v0.26.0:
 
 | Model | Single-stream decode | Aggregate, 8 streams | KV cache capacity |
 | --- | --- | --- | --- |
-| gemma-4-31B | 8.9 tok/s | 68 tok/s | 731k tokens |
-| **gemma-4-26B-A4B** (default) | **48.6 tok/s** | **217 tok/s** | 3.3M tokens |
-| gemma-4-12b | 21.5 tok/s | 170 tok/s | 3.0M tokens |
-| gemma-4-E4B | 42.0 tok/s | 343 tok/s | 6.6M tokens |
-| gemma-4-E2B | 78.3 tok/s | 606 tok/s | 19.5M tokens |
+| gemma-4-31B | 8.8 tok/s | 68 tok/s | 476k tokens |
+| **gemma-4-26B-A4B** (default) | **46.3 tok/s** | **211 tok/s** | 2.12M tokens |
+| gemma-4-12b | 21.1 tok/s | 166 tok/s | 1.74M tokens |
+| gemma-4-E4B | 41.8 tok/s | 341 tok/s | 4.76M tokens |
+| gemma-4-E2B | 77.4 tok/s | 591 tok/s | 14.7M tokens |
 
-\* One release behind the RTX PRO 6000 figures above — the Spark was in use when those were re-run on v0.26.0, so these are pending a refresh. Speculative decoding is untested on this hardware for the same reason.
+The GB10's unified LPDDR5X gives roughly a fifth of the discrete card's memory bandwidth, and decode is bandwidth-bound, so everything scales down accordingly. The same conclusion holds even more strongly here: the dense 31B is not interactive on this hardware at 8.8 tok/s, while the 26B-A4B MoE stays comfortably usable. Speculative decoding changes that picture substantially — see [below](#speculative-decoding-on-the-spark).
 
-The GB10's unified LPDDR5X gives roughly a fifth of the discrete card's memory bandwidth, and decode is bandwidth-bound, so everything scales down accordingly. The same conclusion holds even more strongly here: the dense 31B is not interactive on this hardware (~9 tok/s), while the 26B-A4B MoE stays comfortably usable.
+**Decode throughput is within a few percent of v0.25.1 on every model** — between −4.7% and −0.5% single-stream — which is inside the run-to-run spread described below rather than a version regression. KV cache capacity fell by roughly a third for the same reason documented above — v0.26.0's accounting for Gemma 4's two head dimensions — and the reduced figures are still 1.8x to 112x each model's own maximum context.
+
+**Expect up to 5% run-to-run spread on these figures, and do not read a small delta as a regression.** Repeating the same configuration on the same hardware moved these numbers by as much as 5%, so treat any sub-5% difference — against a previous release, another machine, or another run — as noise until it reproduces. These figures were taken on a machine that had been under continuous load for hours, which is what a running server actually delivers.
+
+#### Speculative decoding on the Spark
+
+DFlash works on GB10 and is the single highest-leverage flag available on this hardware. Same method as above, `num_speculative_tokens: 8`:
+
+| Model | Baseline | DFlash | Single | Aggregate | Acceptance | KV cache |
+| --- | --- | --- | --- | --- | --- | --- |
+| gemma-4-31B | 8.8 / 68 | **19.2 / 111** | +118% | +64% | 21.3% | 476k → 426k |
+| **gemma-4-26B-A4B** (default) | 46.3 / 211 | **56.0 / 217** | +21% | +3.1% | 16.0% | 2.12M → 1.89M |
+| gemma-4-12b | 21.1 / 166 | **40.8 / 242** | +93% | +45% | 18.5% | 1.74M → 1.56M |
+
+*single-stream tok/s / aggregate tok/s at 8 streams.*
+
+The dense-model gains match what the RTX PRO 6000 sees (+118% here against +114% there), which is the expected result: dense decode is bandwidth-bound, the Spark is bandwidth-poor, and speculation amortizes each weight read across several tokens. Three things are specific to this hardware:
+
+- **The 31B becomes usable.** 8.8 tok/s is below reading speed; 19.2 tok/s is not. That does not make it the right default — the MoE is still faster untuned than the 31B is with DFlash — but it moves the dense 31B from "not worth serving here" to "viable if you need its quality".
+- **The 12b with DFlash is the Spark's aggregate throughput winner** among the three, at 242 tok/s against the MoE's 217. If you are serving several concurrent users and can accept a 12B-class model, that is the configuration to run.
+- **The MoE gains single-stream but almost nothing in aggregate** (+21% vs +3.1%). At 8 concurrent streams it already amortizes weight reads across the batch, so there is little left for speculation to reclaim — the same effect the RTX shows, but starker here.
+
+Two caveats on these numbers. `num_speculative_tokens: 8` was carried over from the RTX tuning rather than re-swept on GB10; per-position acceptance decays steeply (0.81, 0.54, 0.36, 0.18, 0.12, 0.06, 0.05, 0.03), so positions 6–8 contribute only ~6% of accepted tokens and a shorter draft would likely trade a little throughput for meaningfully less verification work. And **MTP is untested on the Spark** — on the RTX it beat DFlash on the MoE for aggregate throughput, so the MoE row here may not be that model's best available configuration.
+
+### Serving under concurrency
+
+The tables above measure one client, or eight. This one sweeps concurrency and prompt length with `vllm bench serve` across both machines and the two models worth serving, to answer what those tables cannot: how many people can this serve at once, and what does it feel like while it does.
+
+Method: `--dataset-name random`, 1024 output tokens per request, `--ignore-eos` so every request generates exactly that many, `--seed 0`, all requests submitted at once (`--request-rate inf`). The prefix cache is flushed between every shape — the seeded dataset generates identical prompts for consecutive shapes, so without a flush each shape prefills out of the previous one's KV blocks, which inflated throughput by 37% and understated TTFT by 12x in testing.
+
+**1,024-token prompts** — output tok/s / p99 ITL
+
+| Config | c1 | c8 | c32 | c64 |
+| --- | --- | --- | --- | --- |
+| RTX PRO 6000 · 26B-A4B | 207 / 5 ms | 1,159 / 8 ms | 2,932 / 12 ms | 4,247 / 16 ms |
+| RTX PRO 6000 · 31B | 55 / 19 ms | 377 / 22 ms | 1,031 / 30 ms | 1,460 / 40 ms |
+| DGX Spark · 26B-A4B | 46 / 23 ms | 241 / 35 ms | 508 / 65 ms | 682 / 93 ms |
+| DGX Spark · 31B | 9 / 118 ms | 60 / 137 ms | 154 / 189 ms | 205 / 273 ms |
+
+**8,192-token prompts** — output tok/s / p99 ITL
+
+| Config | c1 | c8 | c32 | c64 |
+| --- | --- | --- | --- | --- |
+| RTX PRO 6000 · 26B-A4B | 182 / 7 ms | 937 / 9 ms | 1,844 / 14 ms | 2,299 / 20 ms |
+| RTX PRO 6000 · 31B | 50 / 20 ms | 271 / 23 ms | 505 / 37 ms | 597 / 52 ms |
+| DGX Spark · 26B-A4B | 42 / 24 ms | 178 / 38 ms | 279 / 82 ms | 344 / 115 ms |
+| DGX Spark · 31B | 8 / 121 ms | 40 / 145 ms | 67 / 242 ms | 76 / 391 ms |
+
+Reading it:
+
+- **The MoE is the one to serve.** On the RTX PRO 6000 it sustains 4,247 tok/s across 64 concurrent 1k-prompt requests at a 16 ms p99 inter-token latency — about 66 tok/s per user, every one of them faster than reading speed. The dense 31B manages 1,460 tok/s on the same shape.
+- **Tail latency stays interactive on the discrete card everywhere.** p99 ITL never exceeds 52 ms in any of its 16 cells, including 64 concurrent 8k-token prompts. Concurrency costs throughput per user, not smoothness.
+- **On the Spark, concurrency is where the MoE earns its place.** It scales 46 → 682 tok/s from c1 to c64 while holding p99 ITL under 100 ms. The dense 31B on the same shape gives 205 tok/s at a 273 ms p99 — visibly stuttery, and the clearest statement yet that the 31B is the wrong model for this hardware.
+- **Long prompts cost more than long outputs.** Moving from 1k to 8k prompts costs 46% of c64 throughput on the RTX MoE and 50% on the Spark MoE, because prefill competes with decode for the same token budget rather than adding to it.
+
+**TTFT at high concurrency is queueing, not latency.** Every request is submitted at t=0, so at 8k/c64 the server has 512k tokens of prompt to chew through before the last request emits anything — which is how the Spark's dense 31B reports a 271-second median TTFT. That is a saturation measure, not interactive latency. Median TTFT at c1 is the number a user would actually see:
+
+| Config | 1k c1 | 1k c64 | 8k c1 | 8k c64 |
+| --- | --- | --- | --- | --- |
+| RTX PRO 6000 · 26B-A4B | 0.03 s | 0.72 s | 0.18 s | 5.87 s |
+| RTX PRO 6000 · 31B | 0.09 s | 3.59 s | 0.88 s | 32.47 s |
+| DGX Spark · 26B-A4B | 0.14 s | 3.88 s | 1.27 s | 42.49 s |
+| DGX Spark · 31B | 0.43 s | 37.45 s | 7.46 s | 271.09 s |
 
 ## Tuning
 
-- `--gpu-memory-utilization 0.92` leaves headroom for CUDA graph capture; pushing it higher can OOM after the KV cache is allocated.
+- `--gpu-memory-utilization 0.92` leaves headroom for CUDA graph capture; pushing it higher can OOM after the KV cache is allocated. Verified safe for Gemma 4 on a 96 GB RTX PRO 6000 — it survives 8k prompts at 32 and 64 concurrent with no OOM and no engine restart. Other model families are less forgiving at this value, so it is worth re-checking if you point this compose file at something else.
 - On unified-memory machines (DGX Spark / GB10) use [docker-compose.spark.yml](docker-compose.spark.yml) instead — select it with `COMPOSE_FILE=docker-compose.spark.yml` in `.env`. The GPU shares its ~120 GB with the OS: utilization is capped at 0.78 because higher fractions starve the host during KV-cache allocation, hard enough to need a power cycle at 0.92 (disable swap so an overrun OOM-kills the engine instead of thrashing).
 - On GPUs with less memory, lower `--max-model-len` first — the full 262k context is the main memory consumer after the weights.
-- `--max-num-seqs 64` and `--max-num-batched-tokens 32768` are sized for a workstation serving a handful of concurrent clients; raise them for heavier batch serving.
+- `--max-num-seqs 64` is sized for a workstation serving a handful of concurrent clients; raise it for heavier batch serving. `--max-num-batched-tokens 32768` is a different matter — it has been swept and should be left alone, for the reasons below.
+- **`--max-num-batched-tokens 32768` is the right default on both machines, but for different reasons.** Swept across 4096/8192/32768 on all five models. On the RTX PRO 6000 lowering it is simply pointless: the best any lower value bought was +2.6% throughput. On the DGX Spark it is a real trade — 4096 is worth **+7% to +14%** on the dense models (31B +14%, 12b +12%, E2B +9.4%, E4B +7%), because a smaller GEMM is more efficient against unified LPDDR5X. The 26B-A4B MoE is the exception on both machines, gaining at most ~3% (two runs measured +0.3% and +3.1%, which brackets the run-to-run noise) — so the default model is the one with the least to gain from tuning this.
+- **What lowering it costs is tail latency, everywhere: p99 ITL gets 5–15x worse.** The mechanism is that a chunked-prefill step blocks decoding requests only when it consumes the whole token budget. Once the budget exceeds the prompt, prefill and decode co-schedule in the same step and the stall stops existing rather than merely getting shorter — which is why 32768 is not on the same curve as 8192 and 4096 at all. Between those two the usual model does hold: halving the chunk halves the stall, measured at 1.84–2.39x across every model and both machines. Lowering MNBT is also a *capacity* lever, buying 1.9–3.7x the KV cache since peak activation memory falls with chunk size.
+- **The one case where that trade is worth taking is the dense 31B**, which is the only model without comfortable KV headroom (1.6x its own 262k context on the RTX PRO 6000, 1.8x on the Spark; the other four have 6x–112x). On the Spark at 8k prompts, dropping it to 4096 gives 2.8x the KV cache, 19% lower TTFT and 14% more throughput at c32 — but takes p99 ITL from 234 ms to 3,233 ms. Reasonable for long-context batch work, wrong for interactive serving, which is what the default targets.
+- **4096 is the floor for any Gemma 4 model.** These are multimodal, and vLLM refuses to start when `--max-num-batched-tokens` is below the encoder's per-item budget: `max_tokens_per_mm_item (2496) is larger than max_num_batched_tokens`.
 - Vision detail per image is tunable per request: `"mm_processor_kwargs": {"max_soft_tokens": 1120}` (default 280; 70 for cheap thumbnails).
 - Speculative decoding is not enabled by default, but both a DFlash and an MTP drafter exist for these models and are worth adding — see [Enabling speculative decoding](#enabling-speculative-decoding).
-- On this GPU vLLM serves Gemma 4 with the Triton attention backend, not FlashAttention. Gemma 4's head dimensions differ between sliding-window (256) and global (512) layers, which needs FA4; FA3/FA4 are not built for sm_120, so vLLM logs `FA4 not available, forcing TRITON_ATTN backend` and falls back. There is nothing to tune here — it is the only working backend for this combination — but it explains why `--attention-backend flash_attn` fails.
+- On both these GPUs vLLM serves Gemma 4 with the Triton attention backend, not FlashAttention. Gemma 4's head dimensions differ between sliding-window (256) and global (512) layers, which needs FA4; FA3/FA4 are built for neither sm_120 (RTX PRO 6000) nor sm_121 (GB10), so vLLM logs `FA4 not available, forcing TRITON_ATTN backend` and falls back. There is nothing to tune here — it is the only working backend for this combination — but it explains why `--attention-backend flash_attn` fails, and why a DFlash drafter needs its own `"attention_backend"` entry (see [Enabling speculative decoding](#enabling-speculative-decoding)).
 
 ## License
 
