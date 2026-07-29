@@ -12,7 +12,7 @@ Default model: [unsloth/gemma-4-26B-A4B-it-NVFP4](https://huggingface.co/unsloth
 | [gemma-4-E4B-it-NVFP4](https://huggingface.co/unsloth/gemma-4-E4B-it-NVFP4) | 4B effective | 131,072 | Audio input support |
 | [gemma-4-E2B-it-NVFP4](https://huggingface.co/unsloth/gemma-4-E2B-it-NVFP4) | 2B effective | 131,072 | Audio input support |
 
-All five have been verified with this compose file on an RTX PRO 6000 Blackwell (96 GB) and a DGX Spark (GB10), both running vLLM v0.26.0 — see [Benchmarks](#benchmarks). Optional [speculative decoding](#enabling-speculative-decoding) adds up to +118% decode on the dense models.
+All five have been verified with this compose file on an RTX PRO 6000 Blackwell (96 GB) and a DGX Spark (GB10), both running vLLM v0.26.0 — see [Benchmarks](#benchmarks). Optional [speculative decoding](#enabling-speculative-decoding) adds up to +118% decode on the dense models. All five also run across two DGX Sparks as one tensor-parallel cluster — see [Two-Spark cluster](#two-spark-cluster).
 
 ## Requirements
 
@@ -119,6 +119,23 @@ Two caveats on the V2 runner:
 - It does not support the `thinking_token_budget` request parameter. If you need that, you cannot use MTP on this release.
 - **MTP does not work on the 12b.** The 12b is the `gemma4_unified` architecture, and its assistant trips a separate bug during CUDA graph capture: `compute_logits` suppresses tokens with `logits[:, self._suppress_token_ids] = -inf` using a CPU index tensor, which capture rejects. Adding `--enforce-eager` does get it to start — confirming that is the cause — but it is not worth doing: without CUDA graphs the 12b drops to 76 tok/s, well below its 114 tok/s baseline. Use DFlash on the 12b, which is the better choice there regardless.
 
+## Two-Spark cluster
+
+[run_cluster.sh](run_cluster.sh) joins two DGX Sparks into a Ray cluster and serves one Gemma 4 model across both GPUs with tensor parallelism (TP=2), NCCL riding RDMA (RoCE) over the dedicated 200 GbE link between them. A single GB10 already runs every model in this repo; what the second Spark buys is headroom — twice the aggregate memory bandwidth and twice the KV-cache memory — at the price of putting every per-layer all-reduce on the wire. What that trade returns varies enormously by model, from +80% single-stream decode on the dense 31B to a marginal +4% aggregate on the E2B — see [the cluster benchmarks](#2x-dgx-spark-tp2-cluster).
+
+```bash
+./run_cluster.sh head                # on the head Spark
+./run_cluster.sh worker              # on the other Spark (head IP from .env, or pass it)
+./run_cluster.sh serve 31b           # back on the head; 31b | 26b-a4b | 12b | e4b | e2b
+```
+
+`status` reports tmux/container/Ray/API state on any node; `stop` tears down that node's half. Everything long-running lives in detached tmux sessions (`ray-node` holds the Ray container on each node, `vllm-serve` holds the engine on the head), so an SSH drop doesn't take the cluster down; engine output is mirrored to `~/vllm-cluster-serve.log`. Set `CLUSTER_HEAD_IP` in `.env` (see `.env.example`) to the head's IP *on the 200G link*; `CLUSTER_IF` and `CLUSTER_HCA` default to the Spark's 200G netdev and its RoCE device. The image ships without Ray, so each node pip-installs it at container start (~1 min, needs internet). Once healthy, the API is on port 8000 of the head node, same as the single-node compose.
+
+The serve profile reuses the single-Spark tuning unchanged — fp8 KV cache, utilization 0.78 (a per-node fraction; the host-starvation ceiling it protects doesn't move by adding a machine), `--max-num-batched-tokens 32768` — with vision and both parsers enabled. Speculative decoding is not configured on the cluster. Two things are specific to this setup:
+
+- **The 26B-A4B runs its expert layers with expert parallelism** (`--enable-expert-parallel`, already wired into the script), not tensor parallelism. TP=2 would halve each expert's intermediate size (704 → 352), making the fused gate|up weight 704 rows — not a multiple of the NVFP4 128-row scale tile — and the fast `FLASHINFER_CUTLASS` MoE backend refuses to pad gated weights (`NotImplementedError` at load). With EP each rank instead holds 64 whole experts at the single-GPU shape, the fast backend loads as-is, and attention is still TP=2.
+- **The cluster pins a nightly vLLM image** by commit SHA instead of v0.26.0. v0.26.0's shared-memory message queue — which the engine uses to drive cross-node workers — can lose a reader wakeup notification, parking the engine and both workers forever on queues that have data; the engine then dies minutes later with "RPC call to sample_tokens timed out". Upstream has since bounded the park time so a lost wakeup recovers within ~5 s, and the pinned nightly is the first known-good image. Single-node deployments don't exercise this path at risk, so the compose files stay on v0.26.0. The pin moves to the next tagged release when it lands.
+
 ## Benchmarks
 
 Measured 2026-07-26 on an RTX PRO 6000 Blackwell (96 GB) with vLLM v0.26.0 and this repo's compose settings (fp8 KV cache, no speculative decoding). Method: greedy decoding, 1024 tokens generated per request; single-stream is the mean of one run per prompt (8 prompts), aggregate is one batch of 8 concurrent streams. Reproduce with [bench.py](bench.py) (stdlib only) against a running server:
@@ -203,11 +220,31 @@ The dense-model gains match what the RTX PRO 6000 sees (+118% here against +114%
 
 Two caveats on these numbers. `num_speculative_tokens: 8` was carried over from the RTX tuning rather than re-swept on GB10; per-position acceptance decays steeply (0.81, 0.54, 0.36, 0.18, 0.12, 0.06, 0.05, 0.03), so positions 6–8 contribute only ~6% of accepted tokens and a shorter draft would likely trade a little throughput for meaningfully less verification work. And **MTP is untested on the Spark** — on the RTX it beat DFlash on the MoE for aggregate throughput, so the MoE row here may not be that model's best available configuration.
 
+### 2x DGX Spark (TP=2 cluster)
+
+Same method on both Sparks joined by [run_cluster.sh](run_cluster.sh) — TP=2 over the 200 GbE RoCE link, `--gpu-memory-utilization 0.78` per node, no speculative decoding. Measured 2026-07-28 on the cluster's pinned nightly image (see [Two-Spark cluster](#two-spark-cluster)); the comparison columns are against the v0.26.0 single-Spark table above:
+
+| Model | Single-stream decode | Aggregate, 8 streams | KV cache capacity | vs one Spark (single / agg / KV) |
+| --- | --- | --- | --- | --- |
+| gemma-4-31B | 15.8 tok/s | 117 tok/s | 1.12M tokens | +80% / +72% / 2.35x |
+| **gemma-4-26B-A4B** (default) | **62.1 tok/s** | **297 tok/s** | 4.54M tokens | +34% / +41% / 2.14x |
+| gemma-4-12b | 34.1 tok/s | 248 tok/s | 3.15M tokens | +62% / +49% / 1.81x |
+| gemma-4-E4B | 58.7 tok/s | 422 tok/s | 9.81M tokens | +40% / +24% / 2.06x |
+| gemma-4-E2B | 96.0 tok/s | 616 tok/s | 15.0M tokens | +24% / +4% / 1.02x |
+
+How much the second Spark buys tracks how starved the model was in the first place:
+
+- **The dense models gain most, and the biggest gains the most of all.** Decode on a dense model is memory-bandwidth-bound, and TP=2 splits every weight read across two memory systems: +80% single-stream on the 31B (8.8 → 15.8 tok/s), +62% on the 12b. The 31B also frees the most weight memory per node, which is why its KV capacity scales furthest (2.35x).
+- **The MoE gains a solid +34% / +41% through expert parallelism.** With only 3.8B active parameters it is far less bandwidth-starved than the dense models, so there is less for the cluster to reclaim — but at 62 tok/s single-stream and 4.54M tokens of KV cache it is still the model to serve, now with 2.1x the capacity.
+- **The E2B is the floor of the approach.** +24% single-stream, +4% aggregate — and its KV cache capacity does not grow at all (1.02x). That last one is architectural, not noise: the E2B has a single KV head (`num_key_value_heads: 1`), which TP=2 must replicate on both ranks, so each node still pays the full per-token KV cost and total capacity stays at one node's worth. The E4B's two KV heads split exactly, hence its 2.06x. Below ~4B effective parameters, the wire costs about what the second memory system pays back.
+
+DFlash and MTP were not re-benchmarked on the cluster; the [single-Spark speculative numbers](#speculative-decoding-on-the-spark) are the reference if you enable a drafter there.
+
 ### Serving under concurrency
 
-The tables above measure one client, or eight. This one sweeps concurrency and prompt length with `vllm bench serve` across both machines and the two models worth serving, to answer what those tables cannot: how many people can this serve at once, and what does it feel like while it does.
+The tables above measure one client, or eight. This one sweeps concurrency and prompt length with `vllm bench serve` across three configurations and the two models worth serving, to answer what those tables cannot: how many people can this serve at once, and what does it feel like while it does.
 
-Method: `--dataset-name random`, 1024 output tokens per request, `--ignore-eos` so every request generates exactly that many, `--seed 0`, all requests submitted at once (`--request-rate inf`). The prefix cache is flushed between every shape — the seeded dataset generates identical prompts for consecutive shapes, so without a flush each shape prefills out of the previous one's KV blocks, which inflated throughput by 37% and understated TTFT by 12x in testing.
+Method: `--dataset-name random`, 1024 output tokens per request, `--ignore-eos` so every request generates exactly that many, `--seed 0`, all requests submitted at once (`--request-rate inf`). The prefix cache is flushed between every shape — the seeded dataset generates identical prompts for consecutive shapes, so without a flush each shape prefills out of the previous one's KV blocks, which inflated throughput by 37% and understated TTFT by 12x in testing. (The flush route needs the server started with `VLLM_SERVER_DEV_MODE=1`.) The 2x Spark rows ran on the cluster's pinned nightly, whose `vllm bench serve` is a Rust reimplementation; the classic "Serving Benchmark Result" table is what is reported, same as the other rows.
 
 **1,024-token prompts** — output tok/s / p99 ITL
 
@@ -217,6 +254,8 @@ Method: `--dataset-name random`, 1024 output tokens per request, `--ignore-eos` 
 | RTX PRO 6000 · 31B | 55 / 19 ms | 377 / 22 ms | 1,031 / 30 ms | 1,460 / 40 ms |
 | DGX Spark · 26B-A4B | 46 / 23 ms | 241 / 35 ms | 508 / 65 ms | 682 / 93 ms |
 | DGX Spark · 31B | 9 / 118 ms | 60 / 137 ms | 154 / 189 ms | 205 / 273 ms |
+| 2x DGX Spark · 26B-A4B | 60 / 18 ms | 314 / 26 ms | 719 / 44 ms | 947 / 82 ms |
+| 2x DGX Spark · 31B | 16 / 66 ms | 104 / 74 ms | 259 / 111 ms | 341 / 160 ms |
 
 **8,192-token prompts** — output tok/s / p99 ITL
 
@@ -226,6 +265,8 @@ Method: `--dataset-name random`, 1024 output tokens per request, `--ignore-eos` 
 | RTX PRO 6000 · 31B | 50 / 20 ms | 271 / 23 ms | 505 / 37 ms | 597 / 52 ms |
 | DGX Spark · 26B-A4B | 42 / 24 ms | 178 / 38 ms | 279 / 82 ms | 344 / 115 ms |
 | DGX Spark · 31B | 8 / 121 ms | 40 / 145 ms | 67 / 242 ms | 76 / 391 ms |
+| 2x DGX Spark · 26B-A4B | 54 / 19 ms | 231 / 27 ms | 399 / 63 ms | 442 / 120 ms |
+| 2x DGX Spark · 31B | 14 / 68 ms | 67 / 81 ms | 108 / 146 ms | 124 / 218 ms |
 
 Reading it:
 
@@ -233,6 +274,7 @@ Reading it:
 - **Tail latency stays interactive on the discrete card everywhere.** p99 ITL never exceeds 52 ms in any of its 16 cells, including 64 concurrent 8k-token prompts. Concurrency costs throughput per user, not smoothness.
 - **On the Spark, concurrency is where the MoE earns its place.** It scales 46 → 682 tok/s from c1 to c64 while holding p99 ITL under 100 ms. The dense 31B on the same shape gives 205 tok/s at a 273 ms p99 — visibly stuttery, and the clearest statement yet that the 31B is the wrong model for this hardware.
 - **Long prompts cost more than long outputs.** Moving from 1k to 8k prompts costs 46% of c64 throughput on the RTX MoE and 50% on the Spark MoE, because prefill competes with decode for the same token budget rather than adding to it.
+- **The cluster lifts every cell, and the dense model twice as hard as the MoE.** TP=2 over the 200G link buys the 26B-A4B +28–43% throughput and the 31B +62–76%, on all eight shapes, with better p99 ITL in 15 of the 16 cells (the MoE's 8k/c64 gives back 5 ms). The 31B at 1k/c64 moves from 205 tok/s at a visibly stuttery 273 ms p99 to 341 tok/s at 160 ms: usable now, though the MoE still nearly triples its throughput on the same shape. Prefill also rides the split (~1.5x faster on the 31B, ~1.15x on the MoE), so TTFT drops nearly everywhere — the exception is the MoE's 1k/c64 cell (3.88 → 4.72 s), where prefill is short enough that the per-layer all-reduce cost outweighs the faster compute.
 
 **TTFT at high concurrency is queueing, not latency.** Every request is submitted at t=0, so at 8k/c64 the server has 512k tokens of prompt to chew through before the last request emits anything — which is how the Spark's dense 31B reports a 271-second median TTFT. That is a saturation measure, not interactive latency. Median TTFT at c1 is the number a user would actually see:
 
@@ -242,6 +284,8 @@ Reading it:
 | RTX PRO 6000 · 31B | 0.09 s | 3.59 s | 0.88 s | 32.47 s |
 | DGX Spark · 26B-A4B | 0.14 s | 3.88 s | 1.27 s | 42.49 s |
 | DGX Spark · 31B | 0.43 s | 37.45 s | 7.46 s | 271.09 s |
+| 2x DGX Spark · 26B-A4B | 0.13 s | 4.72 s | 1.10 s | 39.69 s |
+| 2x DGX Spark · 31B | 0.34 s | 19.12 s | 4.96 s | 171.20 s |
 
 ## Tuning
 
