@@ -13,9 +13,12 @@
 #
 #   ./run_cluster.sh head                 # on the head node, first
 #   ./run_cluster.sh worker [head_ip]     # on the second node, once the head is up
-#   ./run_cluster.sh serve [MODEL]        # on the head node: start vLLM
+#   ./run_cluster.sh serve [MODEL] [SPEC] # on the head node: start vLLM
 #                                         #   MODEL: 31b | 26b-a4b (default) |
 #                                         #          12b | e4b | e2b
+#                                         #   SPEC:  dflash | mtp (optional;
+#                                         #          see README for which
+#                                         #          drafter fits which model)
 #   ./run_cluster.sh status               # any node: tmux/container/ray/API state
 #   ./run_cluster.sh stop                 # any node: tear down this node's half
 #
@@ -70,7 +73,7 @@ SERVE_SESSION=vllm-serve
 SERVE_LOG="$HOME/vllm-cluster-serve.log"
 
 usage() {
-  sed -n '2,48p' "$SELF" | sed 's/^# \{0,1\}//'
+  sed -n '2,51p' "$SELF" | sed 's/^# \{0,1\}//'
   exit 1
 }
 
@@ -165,10 +168,14 @@ active_ray_nodes() {
 }
 
 cmd_serve() {
-  local model="${1:-26b-a4b}"
+  local model="${1:-26b-a4b}" spec="${2:-}"
   case "$model" in
     31b|26b-a4b|12b|e4b|e2b) ;;
     *) die "unknown model '$model' (want: 31b, 26b-a4b, 12b, e4b or e2b)" ;;
+  esac
+  case "$spec" in
+    ""|dflash|mtp) ;;
+    *) die "unknown speculative mode '$spec' (want: dflash or mtp)" ;;
   esac
 
   docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -q true \
@@ -179,19 +186,21 @@ cmd_serve() {
   nodes="$(active_ray_nodes)"
   [ "$nodes" -ge 2 ] || die "Ray reports $nodes active node(s), need 2 — start './run_cluster.sh worker' on the other Spark and wait for it to join (check: docker exec $CONTAINER ray status)"
 
-  echo "Starting vLLM ($model) on a $nodes-node Ray cluster"
+  echo "Starting vLLM ($model${spec:+ +$spec}) on a $nodes-node Ray cluster"
   tmux new-session -d -s "$SERVE_SESSION" \
     -e VLLM_SERVER_DEV_MODE="${VLLM_SERVER_DEV_MODE:-0}" \
-    "$SELF _serve $model 2>&1 | tee $SERVE_LOG"
+    "$SELF _serve $model $spec 2>&1 | tee $SERVE_LOG"
   echo "Engine starting in tmux session '$SERVE_SESSION' (attach: tmux attach -t $SERVE_SESSION; log: $SERVE_LOG)"
   echo "First boot downloads weights and compiles — expect several minutes before http://localhost:8000/health goes green."
 }
 
 _serve() {
-  local model="$1" repo served len
-  local extra=()
+  local model="$1" spec="${2:-}" repo served len dflash_repo mtp_repo
+  local extra=() exec_env=()
   case "$model" in
-    31b)     repo=unsloth/gemma-4-31B-it-NVFP4     served=gemma-4-31b     len=262144 ;;
+    31b)     repo=unsloth/gemma-4-31B-it-NVFP4     served=gemma-4-31b     len=262144
+             dflash_repo=z-lab/gemma-4-31B-it-DFlash
+             mtp_repo=google/gemma-4-31B-it-assistant ;;
     # The MoE must run its expert layers with expert parallelism (64 whole
     # experts per rank), not tensor parallelism: TP=2 would halve each
     # expert's intermediate size (704 -> 352), making the fused gate|up
@@ -201,11 +210,39 @@ _serve() {
     # single-GPU expert shape and the fast backend loads as-is; attention
     # is still TP=2.
     26b-a4b) repo=unsloth/gemma-4-26B-A4B-it-NVFP4 served=gemma-4-26b-a4b len=262144
-             extra=(--enable-expert-parallel) ;;
-    12b)     repo=unsloth/gemma-4-12b-it-NVFP4     served=gemma-4-12b     len=262144 ;;
+             extra=(--enable-expert-parallel)
+             dflash_repo=z-lab/gemma-4-26B-A4B-it-DFlash
+             mtp_repo=google/gemma-4-26B-A4B-it-assistant ;;
+    # MTP is broken on the 12b: its gemma4_unified compute_logits suppresses
+    # tokens with a CPU index tensor, which CUDA graph capture rejects, and
+    # --enforce-eager lands below baseline. DFlash is the right drafter here.
+    12b)     repo=unsloth/gemma-4-12b-it-NVFP4     served=gemma-4-12b     len=262144
+             dflash_repo=z-lab/gemma4-12B-it-DFlash ;;
     # E-series max out at 131,072 context; vLLM refuses to start above it.
-    e4b)     repo=unsloth/gemma-4-E4B-it-NVFP4     served=gemma-4-e4b     len=131072 ;;
-    e2b)     repo=unsloth/gemma-4-E2B-it-NVFP4     served=gemma-4-e2b     len=131072 ;;
+    # No DFlash drafters exist for them — the assistant (MTP) is their only
+    # speculative option.
+    e4b)     repo=unsloth/gemma-4-E4B-it-NVFP4     served=gemma-4-e4b     len=131072
+             mtp_repo=google/gemma-4-E4B-it-assistant ;;
+    e2b)     repo=unsloth/gemma-4-E2B-it-NVFP4     served=gemma-4-e2b     len=131072
+             mtp_repo=google/gemma-4-E2B-it-assistant ;;
+  esac
+
+  # Optional speculative decoding, mirroring the README's single-node flags:
+  # DFlash pins "attention_backend": "triton_attn" (flash_attn cannot start
+  # against fp8 KV + Gemma 4's PrefixLM attention, and vLLM only propagates
+  # the target's forced backend to MTP drafters, not DFlash ones). MTP needs
+  # the V2 model runner — the V1 proposer only shares target embeddings with
+  # EAGLE-family drafters, and the assistant's pre_projection needs them.
+  case "$spec" in
+    dflash)
+      [ -n "${dflash_repo:-}" ] || die "no DFlash drafter published for $model"
+      extra+=(--speculative-config "{\"method\": \"dflash\", \"model\": \"$dflash_repo\", \"num_speculative_tokens\": 8, \"attention_backend\": \"triton_attn\"}")
+      ;;
+    mtp)
+      [ -n "${mtp_repo:-}" ] || die "MTP not available for $model (broken on the 12b — see the case comment above)"
+      extra+=(--speculative-config "{\"model\": \"$mtp_repo\", \"num_speculative_tokens\": 2}")
+      exec_env+=(-e VLLM_USE_V2_MODEL_RUNNER=1)
+      ;;
   esac
 
   # The engine flags mirror docker-compose.spark.yml — same model config, same
@@ -225,6 +262,7 @@ _serve() {
   # Off by default: the routes are unauthenticated.
   exec docker exec \
     -e VLLM_SERVER_DEV_MODE="${VLLM_SERVER_DEV_MODE:-0}" \
+    "${exec_env[@]}" \
     "$CONTAINER" vllm serve \
     "$repo" \
     --served-model-name "$served" \
@@ -291,7 +329,7 @@ case "${1:-}" in
     [ -n "$head_ip" ] || die "worker needs the head's 200G IP: './run_cluster.sh worker <head_ip>' or CLUSTER_HEAD_IP in .env"
     start_node worker "$head_ip"
     ;;
-  serve)  cmd_serve "${2:-}" ;;
+  serve)  cmd_serve "${2:-}" "${3:-}" ;;
   status) cmd_status ;;
   stop)   cmd_stop ;;
   _node)  shift; _node "$@" ;;

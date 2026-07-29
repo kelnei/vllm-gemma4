@@ -91,7 +91,7 @@ Two things to adjust for the E-series variants:
 
 ## Enabling speculative decoding
 
-Off by default, but worth turning on — it is worth up to +118% decode on the dense models, on both the RTX PRO 6000 and the DGX Spark. See [Speculative decoding](#speculative-decoding) for the measurements behind these recommendations.
+Off by default, but worth turning on — it is worth up to +118% decode on the dense models, on both the RTX PRO 6000 and the DGX Spark. See [Speculative decoding](#speculative-decoding) for the measurements behind these recommendations. (On the two-Spark cluster the same drafters are built into `run_cluster.sh` as a serve argument instead of a compose edit.)
 
 **DFlash** (recommended for the dense 31B and 12b) needs one extra argument in `docker-compose.yml`:
 
@@ -131,7 +131,7 @@ Two caveats on the V2 runner:
 
 `status` reports tmux/container/Ray/API state on any node; `stop` tears down that node's half. Everything long-running lives in detached tmux sessions (`ray-node` holds the Ray container on each node, `vllm-serve` holds the engine on the head), so an SSH drop doesn't take the cluster down; engine output is mirrored to `~/vllm-cluster-serve.log`. Set `CLUSTER_HEAD_IP` in `.env` (see `.env.example`) to the head's IP *on the 200G link*; `CLUSTER_IF` and `CLUSTER_HCA` default to the Spark's 200G netdev and its RoCE device. The image ships without Ray, so each node pip-installs it at container start (~1 min, needs internet). Once healthy, the API is on port 8000 of the head node, same as the single-node compose.
 
-The serve profile reuses the single-Spark tuning unchanged — fp8 KV cache, utilization 0.78 (a per-node fraction; the host-starvation ceiling it protects doesn't move by adding a machine), `--max-num-batched-tokens 32768` — with vision and both parsers enabled. Speculative decoding is not configured on the cluster. Two things are specific to this setup:
+The serve profile reuses the single-Spark tuning unchanged — fp8 KV cache, utilization 0.78 (a per-node fraction; the host-starvation ceiling it protects doesn't move by adding a machine), `--max-num-batched-tokens 32768` — with vision and both parsers enabled. Speculative decoding is an optional second argument to `serve` (e.g. `./run_cluster.sh serve 31b dflash`; `dflash` or `mtp`) — see [Speculative decoding on the cluster](#speculative-decoding-on-the-cluster) for what each buys and the one combination that cannot work. Two things are specific to this setup:
 
 - **The 26B-A4B runs its expert layers with expert parallelism** (`--enable-expert-parallel`, already wired into the script), not tensor parallelism. TP=2 would halve each expert's intermediate size (704 → 352), making the fused gate|up weight 704 rows — not a multiple of the NVFP4 128-row scale tile — and the fast `FLASHINFER_CUTLASS` MoE backend refuses to pad gated weights (`NotImplementedError` at load). With EP each rank instead holds 64 whole experts at the single-GPU shape, the fast backend loads as-is, and attention is still TP=2.
 - **The cluster pins a nightly vLLM image** by commit SHA instead of v0.26.0. v0.26.0's shared-memory message queue — which the engine uses to drive cross-node workers — can lose a reader wakeup notification, parking the engine and both workers forever on queues that have data; the engine then dies minutes later with "RPC call to sample_tokens timed out". Upstream has since bounded the park time so a lost wakeup recovers within ~5 s, and the pinned nightly is the first known-good image. Single-node deployments don't exercise this path at risk, so the compose files stay on v0.26.0. The pin moves to the next tagged release when it lands.
@@ -160,7 +160,7 @@ Decode throughput is unchanged from v0.25.1 (within ~1% on every model), but rep
 
 Gemma 4's NVFP4 checkpoints bundle no draft head, but two separate drafters exist, and vLLM v0.26.0 supports both. Neither is enabled in `docker-compose.yml` — see [Enabling speculative decoding](#enabling-speculative-decoding) for the flags.
 
-- **MTP** — Google's `*-it-assistant` checkpoints, a 4-layer decoder that shares the target's KV cache. Published for all five models.
+- **MTP** — Google's `*-it-assistant` checkpoints, a 4-layer decoder that shares the target's KV cache. Published for all five models; the E-series assistants (the only speculative option for E4B/E2B, which have no DFlash drafter) are validated on the [two-Spark cluster](#speculative-decoding-on-the-cluster).
 - **DFlash** — [z-lab](https://z-lab.ai/projects/dflash/)'s block-diffusion drafter, which proposes a whole block in one pass. Published for the 31B, 26B-A4B and 12b.
 
 Same method and hardware as above, `num_speculative_tokens` tuned per method (2 for MTP, 8 for DFlash):
@@ -238,7 +238,24 @@ How much the second Spark buys tracks how starved the model was in the first pla
 - **The MoE gains a solid +34% / +41% through expert parallelism.** With only 3.8B active parameters it is far less bandwidth-starved than the dense models, so there is less for the cluster to reclaim — but at 62 tok/s single-stream and 4.54M tokens of KV cache it is still the model to serve, now with 2.1x the capacity.
 - **The E2B is the floor of the approach.** +24% single-stream, +4% aggregate — and its KV cache capacity does not grow at all (1.02x). That last one is architectural, not noise: the E2B has a single KV head (`num_key_value_heads: 1`), which TP=2 must replicate on both ranks, so each node still pays the full per-token KV cost and total capacity stays at one node's worth. The E4B's two KV heads split exactly, hence its 2.06x. Below ~4B effective parameters, the wire costs about what the second memory system pays back.
 
-DFlash and MTP were not re-benchmarked on the cluster; the [single-Spark speculative numbers](#speculative-decoding-on-the-spark) are the reference if you enable a drafter there.
+#### Speculative decoding on the cluster
+
+Same method again, with the drafters from the single-node setup (`num_speculative_tokens` 8 for DFlash, 2 for MTP) served via `run_cluster.sh serve <model> <dflash|mtp>`:
+
+| Model + drafter | Baseline | With drafter | Single | Aggregate | Acceptance | KV cache |
+| --- | --- | --- | --- | --- | --- | --- |
+| gemma-4-31B + DFlash | 15.8 / 117 | **33.4 / 161** | +111% | +38% | 21.2% | 1.12M → 1.03M |
+| gemma-4-26B-A4B + DFlash | 62.1 / 297 | **75.9 / 287** | +22% | −3% | 15.6% | 4.54M → 4.06M |
+| gemma-4-12b + DFlash | 34.1 / 248 | **66.7 / 315** | +96% | +27% | 20.5% | 3.15M → 2.84M |
+| gemma-4-E4B + MTP | 58.7 / 422 | **70.9 / 443** | +21% | +5% | 22.9% | 9.81M → 9.76M |
+| gemma-4-E2B + MTP | 96.0 / 616 | **103.1 / 622** | +7% | +1% | 25.3% | 15.0M → 14.9M |
+
+*single-stream tok/s / aggregate tok/s at 8 streams; baseline = cluster without a drafter.*
+
+- **The cluster and the drafter stack almost perfectly multiplicatively.** Multiplying each model's single-Spark DFlash gain by its cluster gain predicts 34.5 / 66.0 / 75.0 tok/s for the 31B / 12b / 26B-A4B; measured is 33.4 / 66.7 / 75.9. The two levers attack independent bottlenecks — the drafter amortizes weight reads across draft tokens, TP=2 halves the reads per node — so neither eats the other's gain.
+- **The dense 31B at 33.4 tok/s is the flagship result**: 3.8x its single-Spark baseline (8.8), and past the point where its quality is usable interactively. The 12b with DFlash (66.7) now outruns even the MoE's cluster baseline (62.1).
+- **The E-series assistants work, and this is their first validation anywhere** — no DFlash drafters exist for E4B/E2B, so MTP is their only speculative option. Acceptance is modest (~0.5 of 2 drafted tokens) yet the E4B still nets +21% single-stream.
+- **The 26B-A4B cannot run MTP on the cluster, full stop.** Its NVFP4 experts force `--enable-expert-parallel` (see [Two-Spark cluster](#two-spark-cluster)), and the V2-runner MTP path builds the draft model's config with the parallel settings inherited — the dense assistant then fails validation with "Number of experts in the model must be greater than 0 when expert parallelism is enabled". Wedged between two constraints, the MoE's only cluster drafter is DFlash until upstream decouples the draft config; on the RTX (no EP needed) MTP remains its better drafter.
 
 ### Serving under concurrency
 
