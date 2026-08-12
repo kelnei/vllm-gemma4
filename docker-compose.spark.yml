@@ -17,7 +17,7 @@ services:
     # Gemma 4 needs vLLM >= 0.24.0; the Gemma 4 sliding-window/FA4 attention
     # fixes landed in v0.25.1, and the image bundles the flashinfer +
     # cutlass-dsl versions the unsloth NVFP4 cute-DSL W4A4 path requires
-    image: vllm/vllm-openai:v0.26.0
+    image: vllm/vllm-openai:v0.27.1
     container_name: vllm-gemma4
     restart: unless-stopped
     ipc: host
@@ -36,6 +36,18 @@ services:
       # persist torch.compile + FlashInfer autotune caches across container
       # recreation: warm start in minutes instead of a full recompile
       - vllm_cache:/root/.cache/vllm
+    # The v0.27.x images bundle transformers 5.15.0, whose heterogeneous
+    # per-layer configs raise on any global access to Gemma 4's head_dim, so
+    # the engine dies at startup (vllm-project/vllm#51744 — fixed on main,
+    # not yet in a release). Pin the last working transformers at container
+    # start; drop this override once a release ships the fix.
+    entrypoint:
+      - bash
+      - -c
+      - |
+        pip install -q --root-user-action=ignore transformers==5.14.1
+        exec vllm serve "$@"
+      - --
     command:
       # the model is passed positionally; it overrides --model if both are given
       - "unsloth/gemma-4-26B-A4B-it-NVFP4"

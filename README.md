@@ -12,7 +12,9 @@ Default model: [unsloth/gemma-4-26B-A4B-it-NVFP4](https://huggingface.co/unsloth
 | [gemma-4-E4B-it-NVFP4](https://huggingface.co/unsloth/gemma-4-E4B-it-NVFP4) | 4B effective | 131,072 | Audio input support |
 | [gemma-4-E2B-it-NVFP4](https://huggingface.co/unsloth/gemma-4-E2B-it-NVFP4) | 2B effective | 131,072 | Audio input support |
 
-All five have been verified with this compose file on an RTX PRO 6000 Blackwell (96 GB) and a DGX Spark (GB10), both running vLLM v0.26.0 — see [Benchmarks](#benchmarks). Optional [speculative decoding](#enabling-speculative-decoding) adds up to +118% decode on the dense models. All five also run across two DGX Sparks as one tensor-parallel cluster — see [Two-Spark cluster](#two-spark-cluster).
+All five have been verified with this compose file on an RTX PRO 6000 Blackwell (96 GB) and a DGX Spark (GB10), both running vLLM v0.26.0 (the repo now pins v0.27.1) — see [Benchmarks](#benchmarks). Optional [speculative decoding](#enabling-speculative-decoding) adds up to +118% decode on the dense models. All five also run across two DGX Sparks as one tensor-parallel cluster — see [Two-Spark cluster](#two-spark-cluster).
+
+> **Note:** the v0.27.x images bundle transformers 5.15.0, whose new heterogeneous per-layer configs make Gemma 4 crash at startup ([vllm-project/vllm#51744](https://github.com/vllm-project/vllm/issues/51744) — fixed on main, not yet in a release). The compose files and `run_cluster.sh` work around it by pinning `transformers==5.14.1` at container start (~15 s, needs internet); the override is marked with the issue number and can be deleted once a release ships the fix.
 
 ## Requirements
 
@@ -134,7 +136,7 @@ Two caveats on the V2 runner:
 The serve profile reuses the single-Spark tuning unchanged — fp8 KV cache, utilization 0.78 (a per-node fraction; the host-starvation ceiling it protects doesn't move by adding a machine), `--max-num-batched-tokens 32768` — with vision and both parsers enabled. Speculative decoding is an optional second argument to `serve` (e.g. `./run_cluster.sh serve 31b dflash`; `dflash` or `mtp`) — see [Speculative decoding on the cluster](#speculative-decoding-on-the-cluster) for what each buys and the one combination that cannot work. Two things are specific to this setup:
 
 - **The 26B-A4B runs its expert layers with expert parallelism** (`--enable-expert-parallel`, already wired into the script), not tensor parallelism. TP=2 would halve each expert's intermediate size (704 → 352), making the fused gate|up weight 704 rows — not a multiple of the NVFP4 128-row scale tile — and the fast `FLASHINFER_CUTLASS` MoE backend refuses to pad gated weights (`NotImplementedError` at load). With EP each rank instead holds 64 whole experts at the single-GPU shape, the fast backend loads as-is, and attention is still TP=2.
-- **The cluster pins a nightly vLLM image** by commit SHA instead of v0.26.0. v0.26.0's shared-memory message queue — which the engine uses to drive cross-node workers — can lose a reader wakeup notification, parking the engine and both workers forever on queues that have data; the engine then dies minutes later with "RPC call to sample_tokens timed out". Upstream has since bounded the park time so a lost wakeup recovers within ~5 s, and the pinned nightly is the first known-good image. Single-node deployments don't exercise this path at risk, so the compose files stay on v0.26.0. The pin moves to the next tagged release when it lands.
+- **Multi-node needs vLLM v0.27.0 or later.** v0.26.0's shared-memory message queue — which the engine uses to drive cross-node workers — can lose a reader wakeup notification, parking the engine and both workers forever on queues that have data; the engine then dies minutes later with "RPC call to sample_tokens timed out". v0.27.0 bounds the park time so a lost wakeup recovers within ~5 s. Single-node deployments don't exercise this path at risk.
 
 ## Benchmarks
 
@@ -222,7 +224,7 @@ Two caveats on these numbers. `num_speculative_tokens: 8` was carried over from 
 
 ### 2x DGX Spark (TP=2 cluster)
 
-Same method on both Sparks joined by [run_cluster.sh](run_cluster.sh) — TP=2 over the 200 GbE RoCE link, `--gpu-memory-utilization 0.78` per node, no speculative decoding. Measured 2026-07-28 on the cluster's pinned nightly image (see [Two-Spark cluster](#two-spark-cluster)); the comparison columns are against the v0.26.0 single-Spark table above:
+Same method on both Sparks joined by [run_cluster.sh](run_cluster.sh) — TP=2 over the 200 GbE RoCE link, `--gpu-memory-utilization 0.78` per node, no speculative decoding. Measured 2026-07-28 on a v0.27 pre-release nightly image (what the cluster pinned before v0.27.0 shipped the multi-node fix — see [Two-Spark cluster](#two-spark-cluster)); the comparison columns are against the v0.26.0 single-Spark table above:
 
 | Model | Single-stream decode | Aggregate, 8 streams | KV cache capacity | vs one Spark (single / agg / KV) |
 | --- | --- | --- | --- | --- |
@@ -261,7 +263,7 @@ Same method again, with the drafters from the single-node setup (`num_speculativ
 
 The tables above measure one client, or eight. This one sweeps concurrency and prompt length with `vllm bench serve` across three configurations and the two models worth serving, to answer what those tables cannot: how many people can this serve at once, and what does it feel like while it does.
 
-Method: `--dataset-name random`, 1024 output tokens per request, `--ignore-eos` so every request generates exactly that many, `--seed 0`, all requests submitted at once (`--request-rate inf`). The prefix cache is flushed between every shape — the seeded dataset generates identical prompts for consecutive shapes, so without a flush each shape prefills out of the previous one's KV blocks, which inflated throughput by 37% and understated TTFT by 12x in testing. (The flush route needs the server started with `VLLM_SERVER_DEV_MODE=1`.) The 2x Spark rows ran on the cluster's pinned nightly, whose `vllm bench serve` is a Rust reimplementation; the classic "Serving Benchmark Result" table is what is reported, same as the other rows.
+Method: `--dataset-name random`, 1024 output tokens per request, `--ignore-eos` so every request generates exactly that many, `--seed 0`, all requests submitted at once (`--request-rate inf`). The prefix cache is flushed between every shape — the seeded dataset generates identical prompts for consecutive shapes, so without a flush each shape prefills out of the previous one's KV blocks, which inflated throughput by 37% and understated TTFT by 12x in testing. (The flush route needs the server started with `VLLM_SERVER_DEV_MODE=1`.) The 2x Spark rows ran on the v0.27 pre-release nightly the cluster pinned at the time, whose `vllm bench serve` is a Rust reimplementation; the classic "Serving Benchmark Result" table is what is reported, same as the other rows.
 
 **1,024-token prompts** — output tok/s / p99 ITL
 
