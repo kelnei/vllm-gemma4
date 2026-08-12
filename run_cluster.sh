@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# Run Gemma 4 across two DGX Sparks as one Ray cluster (tensor parallel = 2).
+# Run Gemma 4 across multiple DGX Sparks as one Ray cluster (tensor parallel).
 #
 # A single GB10 runs every model in this repo (see docker-compose.spark.yml);
-# what a second Spark buys is headroom — twice the aggregate memory bandwidth
-# and twice the KV-cache memory — at the price of putting every tensor-parallel
+# what more Sparks buy is headroom — N times the aggregate memory bandwidth
+# and N times the KV-cache memory — at the price of putting every tensor-parallel
 # all-reduce on the wire between the machines. That wire must be the dedicated
 # 200 GbE link (~25 GB/s), not the management LAN: this script pins NCCL, Gloo,
 # Ray and vLLM to it and takes the RDMA (RoCE) path rather than TCP.
@@ -12,13 +12,17 @@
 # Usage — each command runs on the Spark it describes:
 #
 #   ./run_cluster.sh head                 # on the head node, first
-#   ./run_cluster.sh worker [head_ip]     # on the second node, once the head is up
-#   ./run_cluster.sh serve [MODEL] [SPEC] # on the head node: start vLLM
+#   ./run_cluster.sh worker [head_ip]     # on each worker node, once the head is up
+#   ./run_cluster.sh serve [MODEL] [SPEC] [TP]
+#                                         # on the head node: start vLLM
 #                                         #   MODEL: 31b | 26b-a4b (default) |
 #                                         #          12b | e4b | e2b
 #                                         #   SPEC:  dflash | mtp (optional;
 #                                         #          see README for which
 #                                         #          drafter fits which model)
+#                                         #   TP:    tensor-parallel size
+#                                         #          (default 2; may follow
+#                                         #          MODEL directly)
 #   ./run_cluster.sh status               # any node: tmux/container/ray/API state
 #   ./run_cluster.sh stop                 # any node: tear down this node's half
 #
@@ -73,7 +77,7 @@ SERVE_SESSION=vllm-serve
 SERVE_LOG="$HOME/vllm-cluster-serve.log"
 
 usage() {
-  sed -n '2,51p' "$SELF" | sed 's/^# \{0,1\}//'
+  sed -n '2,55p' "$SELF" | sed 's/^# \{0,1\}//'
   exit 1
 }
 
@@ -168,14 +172,18 @@ active_ray_nodes() {
 }
 
 cmd_serve() {
-  local model="${1:-26b-a4b}" spec="${2:-}"
+  local model="${1:-26b-a4b}" spec="${2:-}" tp="${3:-2}"
   case "$model" in
     31b|26b-a4b|12b|e4b|e2b) ;;
     *) die "unknown model '$model' (want: 31b, 26b-a4b, 12b, e4b or e2b)" ;;
   esac
   case "$spec" in
     ""|dflash|mtp) ;;
-    *) die "unknown speculative mode '$spec' (want: dflash or mtp)" ;;
+    *[!0-9]*) die "unknown speculative mode '$spec' (want: dflash or mtp)" ;;
+    *) tp="$spec" spec="" ;;  # all digits: the TP size, with SPEC omitted
+  esac
+  case "$tp" in
+    ''|*[!0-9]*) die "tensor-parallel size '$tp' isn't a number" ;;
   esac
 
   docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -q true \
@@ -184,18 +192,18 @@ cmd_serve() {
 
   local nodes
   nodes="$(active_ray_nodes)"
-  [ "$nodes" -ge 2 ] || die "Ray reports $nodes active node(s), need 2 — start './run_cluster.sh worker' on the other Spark and wait for it to join (check: docker exec $CONTAINER ray status)"
+  [ "$nodes" -ge "$tp" ] || die "Ray reports $nodes active node(s), need $tp — start './run_cluster.sh worker' on the other Sparks and wait for them to join (check: docker exec $CONTAINER ray status)"
 
-  echo "Starting vLLM ($model${spec:+ +$spec}) on a $nodes-node Ray cluster"
+  echo "Starting vLLM ($model${spec:+ +$spec}, TP=$tp) on a $nodes-node Ray cluster"
   tmux new-session -d -s "$SERVE_SESSION" \
     -e VLLM_SERVER_DEV_MODE="${VLLM_SERVER_DEV_MODE:-0}" \
-    "$SELF _serve $model $spec 2>&1 | tee $SERVE_LOG"
+    "$SELF _serve $model $tp $spec 2>&1 | tee $SERVE_LOG"
   echo "Engine starting in tmux session '$SERVE_SESSION' (attach: tmux attach -t $SERVE_SESSION; log: $SERVE_LOG)"
   echo "First boot downloads weights and compiles — expect several minutes before http://localhost:8000/health goes green."
 }
 
 _serve() {
-  local model="$1" spec="${2:-}" repo served len dflash_repo mtp_repo
+  local model="$1" tp="${2:-2}" spec="${3:-}" repo served len dflash_repo mtp_repo
   local extra=() exec_env=()
   case "$model" in
     31b)     repo=unsloth/gemma-4-31B-it-NVFP4     served=gemma-4-31b     len=262144
@@ -247,7 +255,7 @@ _serve() {
 
   # The engine flags mirror docker-compose.spark.yml — same model config, same
   # tuning rationale (see the comments there) — plus the two cluster flags:
-  # tensor-parallel-size 2 across the machines, executed over Ray.
+  # tensor-parallel-size (one GPU per Spark) across the machines, over Ray.
   #
   # --gpu-memory-utilization stays at the Spark's tuned 0.78: it is a
   # *per-node* fraction of unified memory and the OS-starvation ceiling it
@@ -268,7 +276,7 @@ _serve() {
     --served-model-name "$served" \
     --host 0.0.0.0 \
     --port 8000 \
-    --tensor-parallel-size 2 \
+    --tensor-parallel-size "$tp" \
     --distributed-executor-backend ray \
     --kv-cache-dtype fp8 \
     --gpu-memory-utilization 0.78 \
@@ -329,7 +337,7 @@ case "${1:-}" in
     [ -n "$head_ip" ] || die "worker needs the head's 200G IP: './run_cluster.sh worker <head_ip>' or CLUSTER_HEAD_IP in .env"
     start_node worker "$head_ip"
     ;;
-  serve)  cmd_serve "${2:-}" "${3:-}" ;;
+  serve)  cmd_serve "${2:-}" "${3:-}" "${4:-}" ;;
   status) cmd_status ;;
   stop)   cmd_stop ;;
   _node)  shift; _node "$@" ;;
