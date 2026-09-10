@@ -12,9 +12,7 @@ Default model: [unsloth/gemma-4-26B-A4B-it-NVFP4](https://huggingface.co/unsloth
 | [gemma-4-E4B-it-NVFP4](https://huggingface.co/unsloth/gemma-4-E4B-it-NVFP4) | 4B effective | 131,072 | Audio input support |
 | [gemma-4-E2B-it-NVFP4](https://huggingface.co/unsloth/gemma-4-E2B-it-NVFP4) | 2B effective | 131,072 | Audio input support |
 
-All five have been verified with this compose file on an RTX PRO 6000 Blackwell (96 GB) and a DGX Spark (GB10), both running vLLM v0.26.0 (the repo now pins v0.27.1) — see [Benchmarks](#benchmarks). Optional [speculative decoding](#enabling-speculative-decoding) adds up to +118% decode on the dense models. All five also run across two DGX Sparks as one tensor-parallel cluster — see [Two-Spark cluster](#two-spark-cluster).
-
-> **Note:** the v0.27.x images bundle transformers 5.15.0, whose new heterogeneous per-layer configs make Gemma 4 crash at startup ([vllm-project/vllm#51744](https://github.com/vllm-project/vllm/issues/51744) — fixed on main, not yet in a release). The compose files and `run_cluster.sh` work around it by pinning `transformers==5.14.1` at container start (~15 s, needs internet); the override is marked with the issue number and can be deleted once a release ships the fix.
+All five have been verified with this compose file on an RTX PRO 6000 Blackwell (96 GB) and a DGX Spark (GB10), both running vLLM v0.26.0; the repo now pins v0.29.0, on which the default 26B-A4B config was re-verified 2026-09-10 on both machines (all smoke tests pass, decode throughput within +3–4% of the v0.26.0 figures) — see [Benchmarks](#benchmarks). Optional [speculative decoding](#enabling-speculative-decoding) adds up to +118% decode on the dense models. All five also run across two DGX Sparks as one tensor-parallel cluster — see [Two-Spark cluster](#two-spark-cluster).
 
 ## Requirements
 

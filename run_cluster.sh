@@ -50,9 +50,7 @@
 #
 # The image ships without Ray, so each node pip-installs ray[default] at
 # container start (~1 min, needs internet) — same bootstrap as vLLM's own
-# examples/run_cluster.sh. The same install pins transformers==5.14.1: the
-# v0.27.x images bundle 5.15.0, which raises on Gemma 4's per-layer head_dim
-# at startup (vllm-project/vllm#51744; fixed on main, not yet in a release).
+# examples/run_cluster.sh.
 
 set -euo pipefail
 
@@ -69,7 +67,7 @@ fi
 
 CLUSTER_IF="${CLUSTER_IF:-enP2p1s0f1np1}"
 CLUSTER_HCA="${CLUSTER_HCA:-roceP2p1s0f1}"
-VLLM_IMAGE="${VLLM_IMAGE:-vllm/vllm-openai:v0.27.1}"
+VLLM_IMAGE="${VLLM_IMAGE:-vllm/vllm-openai:v0.29.0}"
 RAY_PORT=6379
 CONTAINER=ray-node
 NODE_SESSION=ray-node
@@ -118,7 +116,7 @@ start_node() {
 _node() {
   local role="$1" head_ip="$2" this_ip="$3" ifname="$4" hca="$5" image="$6"
 
-  local ray_cmd="pip install -q --root-user-action=ignore 'ray[default]>=2.9' transformers==5.14.1 && ray start --block"
+  local ray_cmd="pip install -q --root-user-action=ignore 'ray[default]>=2.9' && ray start --block"
   if [ "$role" = head ]; then
     ray_cmd+=" --head --node-ip-address=$this_ip --port=$RAY_PORT --include-dashboard=false"
   else
