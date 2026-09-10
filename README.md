@@ -102,22 +102,19 @@ Off by default, but worth turning on — it is worth up to +118% decode on the d
 
 `"attention_backend": "triton_attn"` is required, and is the one place this deviates from the drafter's model card. The card suggests `flash_attn`, which cannot start here: FlashAttention supports neither the fp8 KV cache nor Gemma 4's multimodal PrefixLM attention, and the engine exits during startup. vLLM propagates the target's forced Triton backend to MTP drafters automatically but not to DFlash ones, so it has to be stated. Drafters are `z-lab/gemma-4-31B-it-DFlash`, `z-lab/gemma-4-26B-A4B-it-DFlash` and `z-lab/gemma4-12B-it-DFlash` (note the inconsistent `gemma4-` prefix on the 12b).
 
-**MTP** (recommended for the 26B-A4B MoE) needs the argument *and* an environment variable:
+**MTP** (recommended for the 26B-A4B MoE) needs only the argument:
 
 ```yaml
-    environment:
-      - VLLM_USE_V2_MODEL_RUNNER=1
-    command:
       - "--speculative-config"
       - '{"model": "google/gemma-4-26B-A4B-it-assistant", "num_speculative_tokens": 2}'
 ```
 
-The environment variable is not optional. Under vLLM's default V1 model runner, Gemma 4 MTP fails at startup with `a and b must have same reduction dim, but got [s47, 3840] X [5632, 1024]`. The assistant checkpoint's `pre_projection` expects two backbone-width tensors concatenated (2 x 2816 = 5632), which requires the target's embeddings to be shared into the draft model; the V1 proposer only does that sharing for EAGLE-family drafters, so the draft falls back to its own 1024-wide embeddings and the shapes do not line up. The V2 speculator shares them unconditionally. The method is inferred from the checkpoint, so `"method"` can be omitted.
+The method is inferred from the checkpoint, so `"method"` can be omitted. Drafters are `google/gemma-4-31B-it-assistant`, `google/gemma-4-26B-A4B-it-assistant` and `google/gemma-4-12B-it-assistant` (one per Gemma 4 size; the E-series ones are covered under the [cluster](#speculative-decoding-on-the-cluster)).
 
-Two caveats on the V2 runner:
+Two things that were true on vLLM v0.26.0–v0.27.x and are no longer:
 
-- It does not support the `thinking_token_budget` request parameter. If you need that, you cannot use MTP on this release.
-- **MTP does not work on the 12b.** The 12b is the `gemma4_unified` architecture, and its assistant trips a separate bug during CUDA graph capture: `compute_logits` suppresses tokens with `logits[:, self._suppress_token_ids] = -inf` using a CPU index tensor, which capture rejects. Adding `--enforce-eager` does get it to start — confirming that is the cause — but it is not worth doing: without CUDA graphs the 12b drops to 76 tok/s, well below its 114 tok/s baseline. Use DFlash on the 12b, which is the better choice there regardless.
+- **`VLLM_USE_V2_MODEL_RUNNER=1` is no longer needed.** Gemma 4 MTP requires the target's embeddings to be shared into the draft model (the assistant's `pre_projection` expects two backbone-width tensors concatenated, 2 x 2816 = 5632), and only the V2 model runner's speculator does that sharing; under the old default V1 runner MTP died at startup with `a and b must have same reduction dim, but got [s47, 3840] X [5632, 1024]`. v0.29.0 made the V2 runner the default for every model, so the variable is redundant — re-verified 2026-09-10 without it: 285 / 1,476 tok/s on the 26B-A4B, matching the table below. The V2 runner's earlier gap, no support for the `thinking_token_budget` request parameter, is also closed: the budget is honored on v0.29.0.
+- **MTP now works on the 12b.** Its `gemma4_unified` assistant used to trip CUDA graph capture (`compute_logits` suppressed tokens with a CPU index tensor, and `--enforce-eager` cost more than the drafter returned); vLLM v0.29.0 fixed Gemma 4 MTP under CUDA graphs (vllm-project/vllm#53884). Measured 2026-09-10 on the RTX PRO 6000: 193.8 / 1,339 tok/s against a 114 / 843 baseline — single-stream is a shade behind DFlash (203), aggregate a shade ahead (1,203). DFlash remains the recommendation for the 12b; MTP is now a working alternative, not a broken one.
 
 ## Two-Spark cluster
 
@@ -169,7 +166,7 @@ Same method and hardware as above, `num_speculative_tokens` tuned per method (2 
 | --- | --- | --- | --- |
 | gemma-4-31B | 56.3 / 417 | 101.4 / 697 | **120.3 / 702** |
 | **gemma-4-26B-A4B** (default) | 221 / 1,122 | **283.1 / 1,462** | 278.9 / 1,233 |
-| gemma-4-12b | 114 / 843 | *fails, see below* | **203.1 / 1,203** |
+| gemma-4-12b | 114 / 843 | 193.8 / 1,339 (v0.29.0) | **203.1 / 1,203** |
 
 *single-stream tok/s / aggregate tok/s at 8 streams.*
 
@@ -218,7 +215,7 @@ The dense-model gains match what the RTX PRO 6000 sees (+118% here against +114%
 - **The 12b with DFlash is the Spark's aggregate throughput winner** among the three, at 242 tok/s against the MoE's 217. If you are serving several concurrent users and can accept a 12B-class model, that is the configuration to run.
 - **The MoE gains single-stream but almost nothing in aggregate** (+21% vs +3.1%). At 8 concurrent streams it already amortizes weight reads across the batch, so there is little left for speculation to reclaim — the same effect the RTX shows, but starker here.
 
-Two caveats on these numbers. `num_speculative_tokens: 8` was carried over from the RTX tuning rather than re-swept on GB10; per-position acceptance decays steeply (0.81, 0.54, 0.36, 0.18, 0.12, 0.06, 0.05, 0.03), so positions 6–8 contribute only ~6% of accepted tokens and a shorter draft would likely trade a little throughput for meaningfully less verification work. And **MTP is untested on the Spark** — on the RTX it beat DFlash on the MoE for aggregate throughput, so the MoE row here may not be that model's best available configuration.
+Two caveats on these numbers. `num_speculative_tokens: 8` was carried over from the RTX tuning rather than re-swept on GB10; per-position acceptance decays steeply (0.81, 0.54, 0.36, 0.18, 0.12, 0.06, 0.05, 0.03), so positions 6–8 contribute only ~6% of accepted tokens and a shorter draft would likely trade a little throughput for meaningfully less verification work. And **MTP is mostly untested on the Spark** — on the RTX it beat DFlash on the MoE for aggregate throughput, so the MoE row here may not be that model's best available configuration. The one Spark MTP measurement so far is the 12b on vLLM v0.29.0 (2026-09-10): 39.3 / 270 tok/s, against DFlash's 40.8 / 242 — the same near-tie single-stream and MTP edge in aggregate as on the RTX.
 
 ### 2x DGX Spark (TP=2 cluster)
 

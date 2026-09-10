@@ -202,7 +202,7 @@ cmd_serve() {
 
 _serve() {
   local model="$1" tp="${2:-2}" spec="${3:-}" repo served len dflash_repo mtp_repo
-  local extra=() exec_env=()
+  local extra=()
   case "$model" in
     31b)     repo=unsloth/gemma-4-31B-it-NVFP4     served=gemma-4-31b     len=262144
              dflash_repo=z-lab/gemma-4-31B-it-DFlash
@@ -219,11 +219,12 @@ _serve() {
              extra=(--enable-expert-parallel)
              dflash_repo=z-lab/gemma-4-26B-A4B-it-DFlash
              mtp_repo=google/gemma-4-26B-A4B-it-assistant ;;
-    # MTP is broken on the 12b: its gemma4_unified compute_logits suppresses
-    # tokens with a CPU index tensor, which CUDA graph capture rejects, and
-    # --enforce-eager lands below baseline. DFlash is the right drafter here.
+    # The 12b assistant needs vLLM >= v0.29.0 (earlier releases rejected its
+    # gemma4_unified compute_logits during CUDA graph capture). Validated
+    # single-node on v0.29.0; DFlash still edges it single-stream there.
     12b)     repo=unsloth/gemma-4-12b-it-NVFP4     served=gemma-4-12b     len=262144
-             dflash_repo=z-lab/gemma4-12B-it-DFlash ;;
+             dflash_repo=z-lab/gemma4-12B-it-DFlash
+             mtp_repo=google/gemma-4-12B-it-assistant ;;
     # E-series max out at 131,072 context; vLLM refuses to start above it.
     # No DFlash drafters exist for them — the assistant (MTP) is their only
     # speculative option.
@@ -236,18 +237,17 @@ _serve() {
   # Optional speculative decoding, mirroring the README's single-node flags:
   # DFlash pins "attention_backend": "triton_attn" (flash_attn cannot start
   # against fp8 KV + Gemma 4's PrefixLM attention, and vLLM only propagates
-  # the target's forced backend to MTP drafters, not DFlash ones). MTP needs
-  # the V2 model runner — the V1 proposer only shares target embeddings with
-  # EAGLE-family drafters, and the assistant's pre_projection needs them.
+  # the target's forced backend to MTP drafters, not DFlash ones). MTP relies
+  # on the V2 model runner sharing the target's embeddings into the drafter;
+  # V2 is the default since v0.29.0, so no VLLM_USE_V2_MODEL_RUNNER override.
   case "$spec" in
     dflash)
       [ -n "${dflash_repo:-}" ] || die "no DFlash drafter published for $model"
       extra+=(--speculative-config "{\"method\": \"dflash\", \"model\": \"$dflash_repo\", \"num_speculative_tokens\": 8, \"attention_backend\": \"triton_attn\"}")
       ;;
     mtp)
-      [ -n "${mtp_repo:-}" ] || die "MTP not available for $model (broken on the 12b — see the case comment above)"
+      [ -n "${mtp_repo:-}" ] || die "no MTP assistant published for $model"
       extra+=(--speculative-config "{\"model\": \"$mtp_repo\", \"num_speculative_tokens\": 2}")
-      exec_env+=(-e VLLM_USE_V2_MODEL_RUNNER=1)
       ;;
   esac
 
@@ -268,7 +268,6 @@ _serve() {
   # Off by default: the routes are unauthenticated.
   exec docker exec \
     -e VLLM_SERVER_DEV_MODE="${VLLM_SERVER_DEV_MODE:-0}" \
-    "${exec_env[@]}" \
     "$CONTAINER" vllm serve \
     "$repo" \
     --served-model-name "$served" \
