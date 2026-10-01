@@ -12,7 +12,7 @@ Default model: [unsloth/gemma-4-26B-A4B-it-NVFP4](https://huggingface.co/unsloth
 | [gemma-4-E4B-it-NVFP4](https://huggingface.co/unsloth/gemma-4-E4B-it-NVFP4) | 4B effective | 131,072 | Audio input support |
 | [gemma-4-E2B-it-NVFP4](https://huggingface.co/unsloth/gemma-4-E2B-it-NVFP4) | 2B effective | 131,072 | Audio input support |
 
-All five have been verified with this compose file on an RTX PRO 6000 Blackwell (96 GB) and a DGX Spark (GB10), both running vLLM v0.26.0; the repo now pins v0.29.0, on which the default 26B-A4B config was re-verified 2026-09-10 on both machines (all smoke tests pass, decode throughput within +3–4% of the v0.26.0 figures) — see [Benchmarks](#benchmarks). Optional [speculative decoding](#enabling-speculative-decoding) adds up to +118% decode on the dense models. All five also run across two DGX Sparks as one tensor-parallel cluster — see [Two-Spark cluster](#two-spark-cluster).
+All five have been verified with this compose file on an RTX PRO 6000 Blackwell (96 GB) and a DGX Spark (GB10), both running vLLM v0.26.0; the default 26B-A4B config was re-verified on v0.29.0 on 2026-09-10 on both machines (all smoke tests pass, decode throughput within +3–4% of the v0.26.0 figures). The repo now pins v0.30.0, re-verified on the RTX PRO 6000 on 2026-10-01 for all five models and the recommended speculative configs: everything works as it did on v0.29.0, but single-stream decode is up to 7% slower on every model except the 12b — see [vLLM v0.30.0](#vllm-v0300). The DGX Spark and the two-Spark cluster have not been re-verified on v0.30.0. Optional [speculative decoding](#enabling-speculative-decoding) adds up to +118% decode on the dense models. All five also run across two DGX Sparks as one tensor-parallel cluster — see [Two-Spark cluster](#two-spark-cluster).
 
 ## Requirements
 
@@ -178,6 +178,30 @@ Which drafter wins depends on the model, and the gains are much larger for the d
 - **Speculative throughput is strongly prompt-dependent.** With DFlash on the 26B-A4B, the technical prompts in `bench.py` decode ~50% faster than the prose ones (309 vs 199 tok/s); MTP is steadier (260–303). Predictable text drafts well and narrative does not, so a 3-run mean swings with the prompts it happens to hit — this is why `bench.py` now averages one run per prompt across all 8.
 
 Both drafters cost KV cache capacity: on the 26B-A4B, 1.95M tokens baseline drops to 1.72M with DFlash.
+
+### vLLM v0.30.0
+
+Re-verified 2026-10-01 on the RTX PRO 6000 with the method above. Each v0.30.0 run is paired with a v0.29.0 run of the same config on the same day, so the comparison is not against the months-old tables above. Every config boots with the same kernels and gives the same smoke-test results as on v0.29.0 (chat, thinking, auto tool calls, vision, and a 20-question accuracy set). That includes the E4B and E2B, whose KV-shared layers now load a separate `q_proj` weight instead of a fused `qkv_proj`.
+
+| Config | v0.29.0 | v0.30.0 | Single-stream |
+| --- | --- | --- | --- |
+| gemma-4-31B | 56.7 / 421 | 55.9 / 416 | −1.4% |
+| **gemma-4-26B-A4B** (default) | **228.6 / 1,152** | **216.3 / 1,150** | **−5.4%** |
+| gemma-4-12b | 123.0 / 923 | 123.8 / 930 | +0.7% |
+| gemma-4-E4B | 215.1 / 1,458 | 204.6 / 1,399 | −4.9% |
+| gemma-4-E2B | 320.3 / 2,040 | 297.0 / 1,874 | −7.3% |
+| 31B + DFlash | 121.1 / 665 | 120.1 / 711 | −0.8% |
+| 26B-A4B + MTP | 284.1 / 1,463 | 271.7 / 1,428 | −4.4% |
+| 12b + DFlash | 220.2 / 1,294 | 220.2 / 1,291 | 0.0% |
+| 12b + MTP | 193.3 / 1,334 | 197.0 / 1,391 | +1.9% |
+
+*single-stream tok/s / aggregate tok/s at 8 streams.*
+
+**v0.30.0 decodes a single stream more slowly on every Gemma 4 model except the 12b.** The cost is a roughly fixed 0.25 ms per decode step, not a percentage. That is why it is largest on the fastest model (E2B, −7%), barely visible on the 31B (−1%), and smaller under speculative decoding, which pays it once per several tokens. It is not run-to-run noise: four more 26B-A4B runs, alternating versions and starting with v0.30.0, gave 217.0 and 216.8 tok/s on v0.30.0 against 228.8 and 229.0 on v0.29.0. The 12b uses a different model class (`Gemma4UnifiedForConditionalGeneration`) and shows no slowdown. Aggregate throughput mostly holds, except on the E-series (E2B −8%, E4B −4%).
+
+A torch profile of the 26B-A4B locates the time but not its cause. On v0.30.0 each decode step replays a CUDA graph with the same GEMM, MoE and attention kernels and launch configurations, about 60 fewer small elementwise kernels, and slightly *less* total kernel time. What grows is the idle time between consecutive kernels inside the graph, from ~0.1 µs to ~0.4 µs; across the step's ~800 kernels, that is the whole 0.25 ms. The 12b runs at ~0.4 µs between kernels on both versions: it never had the tighter spacing, so it has nothing to lose, and the same drop in small kernels gives it its slight gain. The GPU driver, CUDA runtime, torch and Triton are the same in both images. Clocks during the benchmark are identical, and nothing else runs on the GPU.
+
+The v0.29.0 controls match the v0.26.0 tables above to within about 1%, with two exceptions: the 26B-A4B runs 3% faster, and the 12b 8% faster (123 against 114, and 220 against 203 with DFlash). Those tables have not been re-measured.
 
 ### DGX Spark (GB10)
 
