@@ -16,7 +16,7 @@ All five have been verified with this compose file on an RTX PRO 6000 Blackwell 
 
 ## Requirements
 
-- An NVIDIA Blackwell GPU — NVFP4 relies on Blackwell's native FP4 tensor cores. The defaults here assume a ~96 GB card; see [Tuning](#tuning) for smaller GPUs.
+- An NVIDIA Blackwell GPU — NVFP4 relies on Blackwell's native FP4 tensor cores. The defaults here assume a ~96 GB card; a 32 GB RTX 5090 has [its own compose file](#rtx-5090-32-gb), and [Tuning](#tuning) covers other smaller GPUs.
 - A recent NVIDIA driver, Docker, and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
 - A Hugging Face token for the model download.
 
@@ -115,6 +115,30 @@ Two things that were true on vLLM v0.26.0–v0.27.x and are no longer:
 
 - **`VLLM_USE_V2_MODEL_RUNNER=1` is no longer needed.** Gemma 4 MTP requires the target's embeddings to be shared into the draft model (the assistant's `pre_projection` expects two backbone-width tensors concatenated, 2 x 2816 = 5632), and only the V2 model runner's speculator does that sharing; under the old default V1 runner MTP died at startup with `a and b must have same reduction dim, but got [s47, 3840] X [5632, 1024]`. v0.29.0 made the V2 runner the default for every model, so the variable is redundant — re-verified 2026-09-10 without it: 285 / 1,476 tok/s on the 26B-A4B, matching the table below. The V2 runner's earlier gap, no support for the `thinking_token_budget` request parameter, is also closed: the budget is honored on v0.29.0.
 - **MTP now works on the 12b.** Its `gemma4_unified` assistant used to trip CUDA graph capture (`compute_logits` suppressed tokens with a CPU index tensor, and `--enforce-eager` cost more than the drafter returned); vLLM v0.29.0 fixed Gemma 4 MTP under CUDA graphs (vllm-project/vllm#53884). Measured 2026-09-10 on the RTX PRO 6000: 193.8 / 1,339 tok/s against a 114 / 843 baseline — single-stream is a shade behind DFlash (203), aggregate a shade ahead (1,203). DFlash remains the recommendation for the 12b; MTP is now a working alternative, not a broken one.
+
+## RTX 5090 (32 GB)
+
+[docker-compose.rtx5090.yml](docker-compose.rtx5090.yml) serves the default 26B-A4B on a single RTX 5090, at the full 262,144-token context, with [MTP](#enabling-speculative-decoding) speculative decoding on. Select it with `COMPOSE_FILE=docker-compose.rtx5090.yml` in `.env`. It assumes a headless machine with the card dedicated to the model.
+
+The stock `docker-compose.yml` does not start on a 32 GB card: after the 16.13 GiB of weights and the activation peak at `--max-num-batched-tokens 32768`, it is left with 7.47 GiB of KV cache against the 8.85 GiB one 262k request needs. The 5090 file lowers that flag to 8192. The activation peak scales with it, and every GiB saved goes to the KV pool (measured without MTP):
+
+| `--max-num-batched-tokens` | KV cache | KV tokens | Full-context requests |
+| --- | --- | --- | --- |
+| 32768 (stock) | 7.47 GiB | — (refuses to start) | — |
+| 16384 | 9.80 GiB | 448,664 | 1.71x |
+| **8192** (shipped) | **10.92 GiB** | **687,683** | **2.62x** |
+| 4096 | 11.45 GiB | 888,194 | 3.39x |
+
+Prefill is unaffected: single 8k, 32k and 100k-token prompts take 183 ms, 1.11 s and 6.9 s at both 8192 and 16384. The cost is the one [Tuning](#tuning) describes for any value below 32768: when long prompts arrive alongside decoding streams, a prefill chunk that fills the whole budget stalls them, so p99 ITL is worse than with the stock file. 32768 does not fit on this card anyway, and 8192 stalls half as long as the 4096 floor. `--gpu-memory-utilization` stays at 0.92. Under load, usage runs past that budget (29,998 MiB) but stays clear of the card: it peaked at 31,092 of 32,607 MiB with MTP (30,334 without), with no failures, across three bursts: 64 concurrent 8k-token prompts, 16 concurrent prompts of four images each at `max_soft_tokens` 1120, and two concurrent 250k-token prompts. A desktop session or any other CUDA process on the card eats into that ~1.5 GiB of headroom.
+
+Measured 2026-10-02 on vLLM v0.30.0 with [bench.py](bench.py), same method as [Benchmarks](#benchmarks). The kernels are the same as on the RTX PRO 6000, and smoke tests pass (chat, thinking, auto tool calls, vision, 20/20 on the accuracy set):
+
+| Config | Single-stream decode | Aggregate, 8 streams | KV cache capacity |
+| --- | --- | --- | --- |
+| **gemma-4-26B-A4B + MTP** (shipped) | **279.0 tok/s** | **1,484 tok/s** | 607,331 tokens |
+| gemma-4-26B-A4B, no MTP | 220.5 tok/s | 1,122 tok/s | 687,683 tokens |
+
+Without MTP that is on par with the RTX PRO 6000 on the same vLLM release (216.3 / 1,150, see [vLLM v0.30.0](#vllm-v0300)). MTP is on here, unlike in the other compose files, because on this card it costs little: the drafter (weights, CUDA graphs and activations) takes 1.3 GiB out of the KV cache, still leaving 2.32x the full context, for +27% single-stream and +32% at 8 streams. Acceptance was 53% at k=2. The KV figure is for a start that loads the compile cache; the first start on a machine compiles from scratch, profiles a higher peak, and gets 570,250 tokens. To turn it off, delete the `--speculative-config` lines.
 
 ## Two-Spark cluster
 
@@ -329,7 +353,7 @@ Reading it:
 
 - `--gpu-memory-utilization 0.92` leaves headroom for CUDA graph capture; pushing it higher can OOM after the KV cache is allocated. Verified safe for Gemma 4 on a 96 GB RTX PRO 6000 — it survives 8k prompts at 32 and 64 concurrent with no OOM and no engine restart. Other model families are less forgiving at this value, so it is worth re-checking if you point this compose file at something else.
 - On unified-memory machines (DGX Spark / GB10) use [docker-compose.spark.yml](docker-compose.spark.yml) instead — select it with `COMPOSE_FILE=docker-compose.spark.yml` in `.env`. The GPU shares its ~120 GB with the OS: utilization is capped at 0.78 because higher fractions starve the host during KV-cache allocation, hard enough to need a power cycle at 0.92 (disable swap so an overrun OOM-kills the engine instead of thrashing).
-- On GPUs with less memory, lower `--max-model-len` first — the full 262k context is the main memory consumer after the weights.
+- On GPUs with less memory, lower `--max-num-batched-tokens` before `--max-model-len`: on a 32 GB card, going from 32768 to 8192 is enough to keep the full 262k context — see [RTX 5090 (32 GB)](#rtx-5090-32-gb). Below that, lower `--max-model-len`; the full 262k context is the main memory consumer after the weights.
 - `--max-num-seqs 64` is sized for a workstation serving a handful of concurrent clients; raise it for heavier batch serving. `--max-num-batched-tokens 32768` is a different matter — it has been swept and should be left alone, for the reasons below.
 - **`--max-num-batched-tokens 32768` is the right default on both machines, but for different reasons.** Swept across 4096/8192/32768 on all five models. On the RTX PRO 6000 lowering it is simply pointless: the best any lower value bought was +2.6% throughput. On the DGX Spark it is a real trade — 4096 is worth **+7% to +14%** on the dense models (31B +14%, 12b +12%, E2B +9.4%, E4B +7%), because a smaller GEMM is more efficient against unified LPDDR5X. The 26B-A4B MoE is the exception on both machines, gaining at most ~3% (two runs measured +0.3% and +3.1%, which brackets the run-to-run noise) — so the default model is the one with the least to gain from tuning this.
 - **What lowering it costs is tail latency, everywhere: p99 ITL gets 5–15x worse.** The mechanism is that a chunked-prefill step blocks decoding requests only when it consumes the whole token budget. Once the budget exceeds the prompt, prefill and decode co-schedule in the same step and the stall stops existing rather than merely getting shorter — which is why 32768 is not on the same curve as 8192 and 4096 at all. Between those two the usual model does hold: halving the chunk halves the stall, measured at 1.84–2.39x across every model and both machines. Lowering MNBT is also a *capacity* lever, buying 1.9–3.7x the KV cache since peak activation memory falls with chunk size.
