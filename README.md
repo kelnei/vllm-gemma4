@@ -12,7 +12,7 @@ Default model: [unsloth/gemma-4-26B-A4B-it-NVFP4](https://huggingface.co/unsloth
 | [gemma-4-E4B-it-NVFP4](https://huggingface.co/unsloth/gemma-4-E4B-it-NVFP4) | 4B effective | 131,072 | Audio input support |
 | [gemma-4-E2B-it-NVFP4](https://huggingface.co/unsloth/gemma-4-E2B-it-NVFP4) | 2B effective | 131,072 | Audio input support |
 
-All five have been verified with this compose file on an RTX PRO 6000 Blackwell (96 GB) and a DGX Spark (GB10), both running vLLM v0.26.0; the default 26B-A4B config was re-verified on v0.29.0 on 2026-09-10 on both machines (all smoke tests pass, decode throughput within +3–4% of the v0.26.0 figures). The repo now pins v0.30.0, re-verified on the RTX PRO 6000 on 2026-10-01 for all five models and the recommended speculative configs: everything works as it did on v0.29.0, but single-stream decode is up to 7% slower on every model except the 12b — see [vLLM v0.30.0](#vllm-v0300). The DGX Spark and the two-Spark cluster have not been re-verified on v0.30.0. Optional [speculative decoding](#enabling-speculative-decoding) adds up to +118% decode on the dense models. All five also run across two DGX Sparks as one tensor-parallel cluster — see [Two-Spark cluster](#two-spark-cluster).
+All five have been verified with this compose file on an RTX PRO 6000 Blackwell (96 GB) and a DGX Spark (GB10), both running vLLM v0.26.0; the default 26B-A4B config was re-verified on v0.29.0 on 2026-09-10 on both machines (all smoke tests pass, decode throughput within +3–4% of the v0.26.0 figures). The repo now pins v0.30.0, re-verified on the RTX PRO 6000 on 2026-10-01 for all five models and the recommended speculative configs: everything works as it did on v0.29.0, but single-stream decode is up to 7% slower on every model except the 12b — see [vLLM v0.30.0](#vllm-v0300). The DGX Spark and the two-Spark cluster have not been re-verified on v0.30.0. Optional [speculative decoding](#enabling-speculative-decoding) adds up to +118% decode on the dense models. All five also run across two DGX Sparks as one tensor-parallel cluster — see [Two-Spark cluster](#two-spark-cluster). And all five run on a single RTX 5090 (32 GB), the 31B without vision; see [RTX 5090 (32 GB)](#rtx-5090-32-gb).
 
 ## Requirements
 
@@ -118,7 +118,7 @@ Two things that were true on vLLM v0.26.0–v0.27.x and are no longer:
 
 ## RTX 5090 (32 GB)
 
-[docker-compose.rtx5090.yml](docker-compose.rtx5090.yml) serves the default 26B-A4B on a single RTX 5090, at the full 262,144-token context, with [MTP](#enabling-speculative-decoding) speculative decoding on. Select it with `COMPOSE_FILE=docker-compose.rtx5090.yml` in `.env`. It assumes a headless machine with the card dedicated to the model.
+[docker-compose.rtx5090.yml](docker-compose.rtx5090.yml) serves the default 26B-A4B on a single RTX 5090, at the full 262,144-token context, with [MTP](#enabling-speculative-decoding) speculative decoding on. Select it with `COMPOSE_FILE=docker-compose.rtx5090.yml` in `.env`. It assumes a headless machine with the card dedicated to the model. The other four models run on the card too, the 31B only without vision; see [Other models on the 5090](#other-models-on-the-5090).
 
 The stock `docker-compose.yml` does not start on a 32 GB card: after the 16.13 GiB of weights and the activation peak at `--max-num-batched-tokens 32768`, it is left with 7.47 GiB of KV cache against the 8.85 GiB one 262k request needs. The 5090 file lowers that flag to 8192. The activation peak scales with it, and every GiB saved goes to the KV pool (measured without MTP):
 
@@ -139,6 +139,34 @@ Measured 2026-10-02 on vLLM v0.30.0 with [bench.py](bench.py), same method as [B
 | gemma-4-26B-A4B, no MTP | 220.5 tok/s | 1,122 tok/s | 687,683 tokens |
 
 Without MTP that is on par with the RTX PRO 6000 on the same vLLM release (216.3 / 1,150, see [vLLM v0.30.0](#vllm-v0300)). MTP is on here, unlike in the other compose files, because on this card it costs little: the drafter (weights, CUDA graphs and activations) takes 1.3 GiB out of the KV cache, still leaving 2.32x the full context, for +27% single-stream and +32% at 8 streams. Acceptance was 53% at k=2. The KV figure is for a start that loads the compile cache; the first start on a machine compiles from scratch, profiles a higher peak, and gets 570,250 tokens. To turn it off, delete the `--speculative-config` lines.
+
+### Other models on the 5090
+
+Start from the 5090 file, swap the model as in [Swapping models](#swapping-models), and replace the drafter in `--speculative-config` with the model's own (or delete it). Same day, release and method as above, at `--max-num-batched-tokens 8192` except for the 31B:
+
+| Config | Context | Single-stream decode | Aggregate, 8 streams | KV cache capacity |
+| --- | --- | --- | --- | --- |
+| gemma-4-31B, text-only + MTP | 49,152 | 103.8 tok/s | 704 tok/s | 50,372 tokens (1.02x) |
+| gemma-4-31B, text-only | 65,536 | 57.3 tok/s | 427 tok/s | 78,847 tokens (1.20x) |
+| **gemma-4-26B-A4B + MTP** (shipped) | 262,144 | **279.0 tok/s** | **1,484 tok/s** | 607,331 tokens (2.32x) |
+| gemma-4-26B-A4B | 262,144 | 220.5 tok/s | 1,122 tok/s | 687,683 tokens (2.62x) |
+| gemma-4-12b + DFlash | 262,144 | 218.1 tok/s | 1,305 tok/s | 758,979 tokens (2.90x) |
+| gemma-4-12b + MTP | 262,144 | 202.7 tok/s | 1,423 tok/s | 943,756 tokens (3.60x) |
+| gemma-4-12b | 262,144 | 127.4 tok/s | 953 tok/s | 1.02M tokens (3.88x) |
+| gemma-4-E4B + MTP | 131,072 | 227.3 tok/s | 1,700 tok/s | 1.84M tokens (14.1x) |
+| gemma-4-E4B | 131,072 | 205.4 tok/s | 1,369 tok/s | 1.93M tokens (14.7x) |
+| gemma-4-E2B + MTP | 131,072 | 340.8 tok/s | 2,569 tok/s | 5.86M tokens (44.7x) |
+| gemma-4-E2B | 131,072 | 307.4 tok/s | 1,891 tok/s | 6.08M tokens (46.4x) |
+
+*In parentheses: how many requests at the full configured context fit at once. DFlash is `z-lab/gemma4-12B-it-DFlash` at k=8 with the `triton_attn` backend, as in [Enabling speculative decoding](#enabling-speculative-decoding); MTP is the size's `google/gemma-4-*-it-assistant` at k=2.*
+
+The card decodes at the RTX PRO 6000's speed: every config measured on both is within 4% of its [v0.30.0](#vllm-v0300) figures, single-stream and at 8 streams, most a little ahead. Both cards are GB202 chips with 1.79 TB/s of memory bandwidth. Each config passed the load test above, with the long prompts cut to fit the context (2 x 125k on the E-series; 2 x 60k, or 2 x 45k with MTP, and no image phase on the 31B), and peaked between 30,268 and 31,272 MiB with no failures. Smoke-test results do not depend on the card: the 26B and 31B pass everything (the 31B has no vision to test), while the 12b, E4B and E2B miss one of the 20 accuracy questions (spelling "necessary" backwards) and read the vision test image's "vLLM" as "LLM", and the E4B returns no reasoning with thinking on. These are model-level misses, not 5090 ones; the 12b gets the image right with DFlash on.
+
+- **The 31B fits only without vision.** With the vision tower, its 23.55 GiB of weights leave 3.0 GiB of KV cache at `--max-num-batched-tokens 8192`, enough for one 7,120-token request, and 9,056 at 4096, the lowest the vision encoder allows. `--language-model-only` drops the vision tower (22.47 GiB of weights) and with it that floor. At `--max-num-batched-tokens 2048` that leaves 5.37 GiB. vLLM puts the longest request that fits at 89k tokens; at `--max-model-len 65536` the pool holds 1.2 full-length requests. Image requests then fail with a 400.
+- **Speculative decoding on the 31B: MTP fits, DFlash does not.** The DFlash drafter (2.86 GiB) runs out of memory while loading. The MTP drafter (`google/gemma-4-31B-it-assistant`, 0.88 GiB) fits, at 3.93 GiB of KV, enough for `--max-model-len 49152`. It is worth +81% single-stream and +65% at 8 streams, at the cost of a quarter of the context.
+- **On the 12b, DFlash wins single-stream and MTP wins at 8 streams**, as on the RTX PRO 6000. MTP also costs less KV.
+- **MTP on the E-series** is worth +11% single-stream on both, and +24% (E4B) and +36% (E2B) at 8 streams. The drafters cost under 5% of the KV cache.
+- **The 31B configs fail their first start.** The first start of any config compiles from scratch and profiles a higher activation peak than later starts, which load the compile cache from the `vllm_cache` volume. On the other models that costs a few percent of the KV cache, but on the 31B it is over 2 GiB: the first start gets 3.11 GiB of KV (1.5 with MTP), less than one full-length request needs, and vLLM exits. The compile cache survives, so the next start comes up with the full figure; with `restart: unless-stopped` that happens on its own. Changing `--max-model-len` invalidates the cache, so expect it again after editing it.
 
 ## Two-Spark cluster
 
@@ -358,7 +386,7 @@ Reading it:
 - **`--max-num-batched-tokens 32768` is the right default on both machines, but for different reasons.** Swept across 4096/8192/32768 on all five models. On the RTX PRO 6000 lowering it is simply pointless: the best any lower value bought was +2.6% throughput. On the DGX Spark it is a real trade — 4096 is worth **+7% to +14%** on the dense models (31B +14%, 12b +12%, E2B +9.4%, E4B +7%), because a smaller GEMM is more efficient against unified LPDDR5X. The 26B-A4B MoE is the exception on both machines, gaining at most ~3% (two runs measured +0.3% and +3.1%, which brackets the run-to-run noise) — so the default model is the one with the least to gain from tuning this.
 - **What lowering it costs is tail latency, everywhere: p99 ITL gets 5–15x worse.** The mechanism is that a chunked-prefill step blocks decoding requests only when it consumes the whole token budget. Once the budget exceeds the prompt, prefill and decode co-schedule in the same step and the stall stops existing rather than merely getting shorter — which is why 32768 is not on the same curve as 8192 and 4096 at all. Between those two the usual model does hold: halving the chunk halves the stall, measured at 1.84–2.39x across every model and both machines. Lowering MNBT is also a *capacity* lever, buying 1.9–3.7x the KV cache since peak activation memory falls with chunk size.
 - **The one case where that trade is worth taking is the dense 31B**, which is the only model without comfortable KV headroom (1.6x its own 262k context on the RTX PRO 6000, 1.8x on the Spark; the other four have 6x–112x). On the Spark at 8k prompts, dropping it to 4096 gives 2.8x the KV cache, 19% lower TTFT and 14% more throughput at c32 — but takes p99 ITL from 234 ms to 3,233 ms. Reasonable for long-context batch work, wrong for interactive serving, which is what the default targets.
-- **4096 is the floor for any Gemma 4 model.** These are multimodal, and vLLM refuses to start when `--max-num-batched-tokens` is below the encoder's per-item budget: `max_tokens_per_mm_item (2496) is larger than max_num_batched_tokens`.
+- **4096 is the floor for any Gemma 4 model.** These are multimodal, and vLLM refuses to start when `--max-num-batched-tokens` is below the encoder's per-item budget: `max_tokens_per_mm_item (2496) is larger than max_num_batched_tokens`. The exception is a text-only server: `--language-model-only` drops the vision encoder and the floor with it, which is how the 31B fits on a [32 GB card](#other-models-on-the-5090).
 - Vision detail per image is tunable per request: `"mm_processor_kwargs": {"max_soft_tokens": 1120}` (default 280; 70 for cheap thumbnails).
 - Speculative decoding is not enabled by default, but both a DFlash and an MTP drafter exist for these models and are worth adding — see [Enabling speculative decoding](#enabling-speculative-decoding).
 - On both these GPUs vLLM serves Gemma 4 with the Triton attention backend, not FlashAttention. Gemma 4's head dimensions differ between sliding-window (256) and global (512) layers, which needs FA4; FA3/FA4 are built for neither sm_120 (RTX PRO 6000) nor sm_121 (GB10), so vLLM logs `FA4 not available, forcing TRITON_ATTN backend` and falls back. There is nothing to tune here — it is the only working backend for this combination — but it explains why `--attention-backend flash_attn` fails, and why a DFlash drafter needs its own `"attention_backend"` entry (see [Enabling speculative decoding](#enabling-speculative-decoding)).
