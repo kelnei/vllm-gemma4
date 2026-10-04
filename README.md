@@ -12,7 +12,7 @@ Default model: [unsloth/gemma-4-26B-A4B-it-NVFP4](https://huggingface.co/unsloth
 | [gemma-4-E4B-it-NVFP4](https://huggingface.co/unsloth/gemma-4-E4B-it-NVFP4) | 4B effective | 131,072 | Audio input support |
 | [gemma-4-E2B-it-NVFP4](https://huggingface.co/unsloth/gemma-4-E2B-it-NVFP4) | 2B effective | 131,072 | Audio input support |
 
-All five have been verified with this compose file on an RTX PRO 6000 Blackwell (96 GB) and a DGX Spark (GB10), both running vLLM v0.26.0; the default 26B-A4B config was re-verified on v0.29.0 on 2026-09-10 on both machines (all smoke tests pass, decode throughput within +3–4% of the v0.26.0 figures). The repo now pins v0.30.0, re-verified on the RTX PRO 6000 on 2026-10-01 for all five models and the recommended speculative configs: everything works as it did on v0.29.0, but single-stream decode is up to 7% slower on every model except the 12b — see [vLLM v0.30.0](#vllm-v0300). The DGX Spark and the two-Spark cluster have not been re-verified on v0.30.0. Optional [speculative decoding](#enabling-speculative-decoding) adds up to +118% decode on the dense models. All five also run across two DGX Sparks as one tensor-parallel cluster — see [Two-Spark cluster](#two-spark-cluster). And all five run on a single RTX 5090 (32 GB), the 31B without vision; see [RTX 5090 (32 GB)](#rtx-5090-32-gb).
+All five have been verified with this compose file on an RTX PRO 6000 Blackwell (96 GB) and a DGX Spark (GB10), both running vLLM v0.26.0; the default 26B-A4B config was re-verified on v0.29.0 on 2026-09-10 on both machines (all smoke tests pass, decode throughput within +3–4% of the v0.26.0 figures). The repo now pins v0.30.0, re-verified on the RTX PRO 6000 on 2026-10-01 for all five models and the recommended speculative configs: everything works as it did on v0.29.0, but single-stream decode is up to 7% slower on every model except the 12b — see [vLLM v0.30.0](#vllm-v0300). The DGX Spark and the two-Spark cluster were re-verified on 2026-10-03 for all five models, with and without each drafter: the RTX slowdown does not show up on the Spark, where every config is within 2% of v0.29.0, but on the cluster the 26B-A4B cannot start with a drafter on stock v0.30.0 — see [Speculative decoding on the cluster](#speculative-decoding-on-the-cluster). Optional [speculative decoding](#enabling-speculative-decoding) adds up to +118% decode on the dense models. All five also run across two or four DGX Sparks as one tensor-parallel cluster, measured on v0.30.0 at both sizes — see [Two-Spark cluster](#two-spark-cluster). And all five run on a single RTX 5090 (32 GB), the 31B without vision; see [RTX 5090 (32 GB)](#rtx-5090-32-gb).
 
 ## Requirements
 
@@ -109,7 +109,7 @@ Off by default, but worth turning on — it is worth up to +118% decode on the d
       - '{"model": "google/gemma-4-26B-A4B-it-assistant", "num_speculative_tokens": 2}'
 ```
 
-The method is inferred from the checkpoint, so `"method"` can be omitted. Drafters are `google/gemma-4-31B-it-assistant`, `google/gemma-4-26B-A4B-it-assistant` and `google/gemma-4-12B-it-assistant` (one per Gemma 4 size; the E-series ones are covered under the [cluster](#speculative-decoding-on-the-cluster)).
+The method is inferred from the checkpoint, so `"method"` can be omitted. Drafters are `google/gemma-4-31B-it-assistant`, `google/gemma-4-26B-A4B-it-assistant` and `google/gemma-4-12B-it-assistant` (one per Gemma 4 size; the E-series ones are measured on the [DGX Spark](#speculative-decoding-on-the-spark) and the [cluster](#speculative-decoding-on-the-cluster)).
 
 Two things that were true on vLLM v0.26.0–v0.27.x and are no longer:
 
@@ -178,11 +178,14 @@ The card decodes at the RTX PRO 6000's speed: every config measured on both is w
 ./run_cluster.sh serve 31b           # back on the head; 31b | 26b-a4b | 12b | e4b | e2b
 ```
 
+More Sparks join the same way: start `worker` on each, then give `serve` the tensor-parallel size as its last argument (`./run_cluster.sh serve 31b dflash 4`). Four Sparks pay off on the dense 31B and 12b; the 26B-A4B gains KV capacity rather than speed, and the E-series runs better on two. See [4x DGX Spark](#4x-dgx-spark-tp4-cluster).
+
 `status` reports tmux/container/Ray/API state on any node; `stop` tears down that node's half. Everything long-running lives in detached tmux sessions (`ray-node` holds the Ray container on each node, `vllm-serve` holds the engine on the head), so an SSH drop doesn't take the cluster down; engine output is mirrored to `~/vllm-cluster-serve.log`. Set `CLUSTER_HEAD_IP` in `.env` (see `.env.example`) to the head's IP *on the 200G link*; `CLUSTER_IF` and `CLUSTER_HCA` default to the Spark's 200G netdev and its RoCE device. The image ships without Ray, so each node pip-installs it at container start (~1 min, needs internet). Once healthy, the API is on port 8000 of the head node, same as the single-node compose.
 
-The serve profile reuses the single-Spark tuning unchanged — fp8 KV cache, utilization 0.78 (a per-node fraction; the host-starvation ceiling it protects doesn't move by adding a machine), `--max-num-batched-tokens 32768` — with vision and both parsers enabled. Speculative decoding is an optional second argument to `serve` (e.g. `./run_cluster.sh serve 31b dflash`; `dflash` or `mtp`) — see [Speculative decoding on the cluster](#speculative-decoding-on-the-cluster) for what each buys and the one combination that cannot work. Two things are specific to this setup:
+The serve profile reuses the single-Spark tuning unchanged — fp8 KV cache, utilization 0.78 (a per-node fraction; the host-starvation ceiling it protects doesn't move by adding a machine), `--max-num-batched-tokens 32768` — with vision and both parsers enabled. Speculative decoding is an optional second argument to `serve` (e.g. `./run_cluster.sh serve 31b dflash`; `dflash` or `mtp`) — see [Speculative decoding on the cluster](#speculative-decoding-on-the-cluster) for what each buys, and for the 26B-A4B, which cannot start with a drafter on stock v0.30.0. Three things are specific to this setup:
 
 - **The 26B-A4B runs its expert layers with expert parallelism** (`--enable-expert-parallel`, already wired into the script), not tensor parallelism. TP=2 would halve each expert's intermediate size (704 → 352), making the fused gate|up weight 704 rows — not a multiple of the NVFP4 128-row scale tile — and the fast `FLASHINFER_CUTLASS` MoE backend refuses to pad gated weights (`NotImplementedError` at load). With EP each rank instead holds 64 whole experts at the single-GPU shape, the fast backend loads as-is, and attention is still TP=2.
+- **On v0.30.0 the 26B-A4B runs on the cluster without a drafter only.** `serve 26b-a4b dflash` needs the v0.29.0 image (`VLLM_IMAGE=vllm/vllm-openai:v0.29.0` on the head and every worker), and `serve 26b-a4b mtp` does not start on any release yet. Both are upstream bugs in how the drafter inherits expert parallelism; see [Speculative decoding on the cluster](#speculative-decoding-on-the-cluster).
 - **Multi-node needs vLLM v0.27.0 or later.** v0.26.0's shared-memory message queue — which the engine uses to drive cross-node workers — can lose a reader wakeup notification, parking the engine and both workers forever on queues that have data; the engine then dies minutes later with "RPC call to sample_tokens timed out". v0.27.0 bounds the park time so a lost wakeup recovers within ~5 s. Single-node deployments don't exercise this path at risk.
 
 ## Benchmarks
@@ -209,7 +212,7 @@ Decode throughput is unchanged from v0.25.1 (within ~1% on every model), but rep
 
 Gemma 4's NVFP4 checkpoints bundle no draft head, but two separate drafters exist, and vLLM v0.26.0 supports both. Neither is enabled in `docker-compose.yml` — see [Enabling speculative decoding](#enabling-speculative-decoding) for the flags.
 
-- **MTP** — Google's `*-it-assistant` checkpoints, a 4-layer decoder that shares the target's KV cache. Published for all five models; the E-series assistants (the only speculative option for E4B/E2B, which have no DFlash drafter) are validated on the [two-Spark cluster](#speculative-decoding-on-the-cluster).
+- **MTP** — Google's `*-it-assistant` checkpoints, a 4-layer decoder that shares the target's KV cache. Published for all five models; the E-series assistants (the only speculative option for E4B/E2B, which have no DFlash drafter) are measured on the [DGX Spark](#speculative-decoding-on-the-spark) and the [two-Spark cluster](#speculative-decoding-on-the-cluster).
 - **DFlash** — [z-lab](https://z-lab.ai/projects/dflash/)'s block-diffusion drafter, which proposes a whole block in one pass. Published for the 31B, 26B-A4B and 12b.
 
 Same method and hardware as above, `num_speculative_tokens` tuned per method (2 for MTP, 8 for DFlash):
@@ -257,78 +260,126 @@ The v0.29.0 controls match the v0.26.0 tables above to within about 1%, with two
 
 ### DGX Spark (GB10)
 
-Same method on a DGX Spark using [docker-compose.spark.yml](docker-compose.spark.yml) (`--gpu-memory-utilization 0.78`, unified memory), re-measured 2026-07-28 on vLLM v0.26.0:
+Same method on a DGX Spark using [docker-compose.spark.yml](docker-compose.spark.yml) (`--gpu-memory-utilization 0.78`, unified memory). Re-measured 2026-10-03 on vLLM v0.30.0, with each config paired with a v0.29.0 run on the same Spark that night. Where a config ran more than once on a version, the figure is the mean:
 
-| Model | Single-stream decode | Aggregate, 8 streams | KV cache capacity |
-| --- | --- | --- | --- |
-| gemma-4-31B | 8.8 tok/s | 68 tok/s | 476k tokens |
-| **gemma-4-26B-A4B** (default) | **46.3 tok/s** | **211 tok/s** | 2.12M tokens |
-| gemma-4-12b | 21.1 tok/s | 166 tok/s | 1.74M tokens |
-| gemma-4-E4B | 41.8 tok/s | 341 tok/s | 4.76M tokens |
-| gemma-4-E2B | 77.4 tok/s | 591 tok/s | 14.7M tokens |
+| Model | Single-stream decode | Aggregate, 8 streams | KV cache capacity | v0.29.0 |
+| --- | --- | --- | --- | --- |
+| gemma-4-31B | 8.9 tok/s | 68 tok/s | 453k tokens | 8.8 / 68 |
+| **gemma-4-26B-A4B** (default) | **47.7 tok/s** | **216 tok/s** | 2.06M tokens | 47.5 / 216 |
+| gemma-4-12b | 21.5 tok/s | 171 tok/s | 1.69M tokens | 21.5 / 170 |
+| gemma-4-E4B | 43.8 tok/s | 361 tok/s | 4.59M tokens | 43.4 / 357 |
+| gemma-4-E2B | 78.9 tok/s | 625 tok/s | 14.2M tokens | 78.6 / 613 |
 
-The GB10's unified LPDDR5X gives roughly a fifth of the discrete card's memory bandwidth, and decode is bandwidth-bound, so everything scales down accordingly. The same conclusion holds even more strongly here: the dense 31B is not interactive on this hardware at 8.8 tok/s, while the 26B-A4B MoE stays comfortably usable. Speculative decoding changes that picture substantially — see [below](#speculative-decoding-on-the-spark).
+*v0.29.0 column: single-stream / aggregate tok/s.*
 
-**Decode throughput is within a few percent of v0.25.1 on every model** — between −4.7% and −0.5% single-stream — which is inside the run-to-run spread described below rather than a version regression. KV cache capacity fell by roughly a third for the same reason documented above — v0.26.0's accounting for Gemma 4's two head dimensions — and the reduced figures are still 1.8x to 112x each model's own maximum context.
+The GB10's unified LPDDR5X gives roughly a fifth of the discrete card's memory bandwidth, and decode is bandwidth-bound, so everything scales down accordingly. The same conclusion holds even more strongly here: the dense 31B is not interactive on this hardware at 8.9 tok/s, while the 26B-A4B MoE stays comfortably usable. Speculative decoding changes that picture substantially — see [below](#speculative-decoding-on-the-spark).
 
-**Expect up to 5% run-to-run spread on these figures, and do not read a small delta as a regression.** Repeating the same configuration on the same hardware moved these numbers by as much as 5%, so treat any sub-5% difference — against a previous release, another machine, or another run — as noise until it reproduces. These figures were taken on a machine that had been under continuous load for hours, which is what a running server actually delivers.
+**v0.30.0's single-stream slowdown does not show up on the Spark.** On the RTX PRO 6000 the release costs ~0.25 ms per decode step (see [vLLM v0.30.0](#vllm-v0300)). At the E2B's 12.7 ms per token here that would be −2%; the E2B measures +0.4%. Every config in this section, with or without a drafter, is within 2% of v0.29.0 single-stream and within 4% at 8 streams. The exception is 31B + DFlash, which varies between starts for an unrelated reason (below). The smoke tests give the same results on both versions: chat, auto tool calls, vision and the accuracy check pass on every model, and with thinking on, the E4B and E2B return no reasoning. Against the v0.26.0 figures this table replaces (2026-07-28), decode is 1–5% faster and KV capacity 2–5% lower.
+
+**Expect up to 5% run-to-run spread on these figures, and do not read a small delta as a regression.** Repeating the same configuration on the same hardware moved these numbers by as much as 5%, and two Sparks running the same config never agreed better than 1–2%. Treat any sub-5% difference — against a previous release, another machine, or another run — as noise until it reproduces. These figures were taken on machines that had been under continuous load for hours, which is what a running server actually delivers.
 
 #### Speculative decoding on the Spark
 
-DFlash works on GB10 and is the single highest-leverage flag available on this hardware. Same method as above, `num_speculative_tokens: 8`:
+Both drafters work on GB10, and speculative decoding is the single highest-leverage flag available on this hardware. Same v0.30.0 runs as above, with DFlash at `num_speculative_tokens: 8` and MTP at 2:
 
-| Model | Baseline | DFlash | Single | Aggregate | Acceptance | KV cache |
-| --- | --- | --- | --- | --- | --- | --- |
-| gemma-4-31B | 8.8 / 68 | **19.2 / 111** | +118% | +64% | 21.3% | 476k → 426k |
-| **gemma-4-26B-A4B** (default) | 46.3 / 211 | **56.0 / 217** | +21% | +3.1% | 16.0% | 2.12M → 1.89M |
-| gemma-4-12b | 21.1 / 166 | **40.8 / 242** | +93% | +45% | 18.5% | 1.74M → 1.56M |
+| Config | Single-stream | Aggregate, 8 streams | vs no drafter (single / agg) | Acceptance | KV cache |
+| --- | --- | --- | --- | --- | --- |
+| gemma-4-31B + DFlash | **17.9–19.6 tok/s** | 106–113 tok/s | +101–120% / +56–67% | 20.9–21.6% | 393k tokens |
+| gemma-4-31B + MTP | 17.4 tok/s | 112 tok/s | +96% / +65% | 53.7% | 435k tokens |
+| **gemma-4-26B-A4B + MTP** | **65.8 tok/s** | **273 tok/s** | +38% / +26% | 53.7% | 2.01M tokens |
+| gemma-4-26B-A4B + DFlash | 55.1 tok/s | 219 tok/s | +16% / +1% | 15.8% | 1.77M tokens |
+| gemma-4-12b + DFlash | **41.3 tok/s** | 239 tok/s | +92% / +40% | 18.3% | 1.48M tokens |
+| gemma-4-12b + MTP | 38.6 tok/s | **264 tok/s** | +80% / +55% | 50.9% | 1.64M tokens |
+| gemma-4-E4B + MTP | 64.0 tok/s | 441 tok/s | +46% / +22% | 23.1% | 4.49M tokens |
+| gemma-4-E2B + MTP | 112.4 tok/s | 701 tok/s | +43% / +12% | 25.4% | 14.0M tokens |
 
-*single-stream tok/s / aggregate tok/s at 8 streams.*
+*The 31B + DFlash row spans six starts on three Sparks; see the last bullet.*
 
-The dense-model gains match what the RTX PRO 6000 sees (+118% here against +114% there), which is the expected result: dense decode is bandwidth-bound, the Spark is bandwidth-poor, and speculation amortizes each weight read across several tokens. Three things are specific to this hardware:
+- **MTP is the MoE's drafter here, by a wider margin than on the RTX.** On the 26B-A4B it beats DFlash by 19% single-stream (65.8 against 55.1 tok/s) and 25% at 8 streams, and it costs less KV (2.01M tokens against 1.77M). DFlash's +16% single-stream and +1% at 8 streams on this model are the smallest gains of any config here. The MoE already amortizes weight reads across the batch, so there is little left for DFlash's long draft to reclaim.
+- **On the dense models the split is the same as on the RTX: DFlash for one stream, MTP for eight.** The 12b runs at 41.3 tok/s with DFlash against 38.6 with MTP, and at 264 tok/s at 8 streams with MTP against 239. On the 31B the two are closer: DFlash's 17.9–19.6 tok/s against MTP's 17.4 single-stream, and a tie at 8 streams. MTP's drafters are smaller and leave more KV cache on both.
+- **The 31B becomes usable.** 8.9 tok/s is below reading speed; 18–20 tok/s is not. That does not make it the right default — the MoE is faster untuned than the 31B is with a drafter — but it moves the dense 31B from "not worth serving here" to "viable if you need its quality".
+- **The E-series assistants are worth far more here than on faster hardware:** +46% single-stream on the E4B and +43% on the E2B, against +11% on the [RTX 5090](#other-models-on-the-5090) and +20% / +13% on the [cluster](#speculative-decoding-on-the-cluster), at the same ~23–25% acceptance. No DFlash drafter exists for these two, so MTP is their only option.
+- **31B + DFlash moves by up to 10% between starts, and FlashInfer's autotuner decides which way.** Six v0.30.0 starts on three Sparks gave 17.9 to 19.6 tok/s (three v0.29.0 starts gave 18.0 to 19.8), while every other config stayed within 3% between starts. On first start, vLLM has FlashInfer time several kernel tactics for each GEMM shape bucket and caches the winners under `/root/.cache/vllm/flashinfer_autotune_cache` in the `vllm_cache` volume, and later starts reuse them. For this config, the FP4 GEMM tactics for the 16-token bucket decide the speed. That is the bucket one stream's verify pass falls into: the current token plus 8 drafts. Starting from a slow Spark's cache, changing only those two entries made the next two starts fast (19.6 and 19.0 tok/s); the unmodified cache gave 17.9. Identical Sparks on the same image picked different tactics, so the choice is effectively timing noise at first start, and it sticks for as long as the cache does. The same spread is why this config has no version comparison.
 
-- **The 31B becomes usable.** 8.8 tok/s is below reading speed; 19.2 tok/s is not. That does not make it the right default — the MoE is still faster untuned than the 31B is with DFlash — but it moves the dense 31B from "not worth serving here" to "viable if you need its quality".
-- **The 12b with DFlash is the Spark's aggregate throughput winner** among the three, at 242 tok/s against the MoE's 217. If you are serving several concurrent users and can accept a 12B-class model, that is the configuration to run.
-- **The MoE gains single-stream but almost nothing in aggregate** (+21% vs +3.1%). At 8 concurrent streams it already amortizes weight reads across the batch, so there is little left for speculation to reclaim — the same effect the RTX shows, but starker here.
-
-Two caveats on these numbers. `num_speculative_tokens: 8` was carried over from the RTX tuning rather than re-swept on GB10; per-position acceptance decays steeply (0.81, 0.54, 0.36, 0.18, 0.12, 0.06, 0.05, 0.03), so positions 6–8 contribute only ~6% of accepted tokens and a shorter draft would likely trade a little throughput for meaningfully less verification work. And **MTP is mostly untested on the Spark** — on the RTX it beat DFlash on the MoE for aggregate throughput, so the MoE row here may not be that model's best available configuration. The one Spark MTP measurement so far is the 12b on vLLM v0.29.0 (2026-09-10): 39.3 / 270 tok/s, against DFlash's 40.8 / 242 — the same near-tie single-stream and MTP edge in aggregate as on the RTX.
+`num_speculative_tokens: 8` was carried over from the RTX tuning rather than re-swept on GB10. Per-position acceptance decays steeply (0.81, 0.54, 0.36, 0.18, 0.12, 0.06, 0.05, 0.03, measured on v0.26.0), so positions 6–8 contribute only ~6% of accepted tokens. A shorter draft would likely trade a little throughput for meaningfully less verification work.
 
 ### 2x DGX Spark (TP=2 cluster)
 
-Same method on both Sparks joined by [run_cluster.sh](run_cluster.sh) — TP=2 over the 200 GbE RoCE link, `--gpu-memory-utilization 0.78` per node, no speculative decoding. Measured 2026-07-28 on a v0.27 pre-release nightly image (what the cluster pinned before v0.27.0 shipped the multi-node fix — see [Two-Spark cluster](#two-spark-cluster)); the comparison columns are against the v0.26.0 single-Spark table above:
+Same method on two Sparks joined by [run_cluster.sh](run_cluster.sh) — TP=2 over the 200 GbE RoCE link, `--gpu-memory-utilization 0.78` per node, no speculative decoding. Re-measured 2026-10-03 on v0.30.0; the comparison columns are against the v0.30.0 single-Spark table above:
 
 | Model | Single-stream decode | Aggregate, 8 streams | KV cache capacity | vs one Spark (single / agg / KV) |
 | --- | --- | --- | --- | --- |
-| gemma-4-31B | 15.8 tok/s | 117 tok/s | 1.12M tokens | +80% / +72% / 2.35x |
-| **gemma-4-26B-A4B** (default) | **62.1 tok/s** | **297 tok/s** | 4.54M tokens | +34% / +41% / 2.14x |
-| gemma-4-12b | 34.1 tok/s | 248 tok/s | 3.15M tokens | +62% / +49% / 1.81x |
-| gemma-4-E4B | 58.7 tok/s | 422 tok/s | 9.81M tokens | +40% / +24% / 2.06x |
-| gemma-4-E2B | 96.0 tok/s | 616 tok/s | 15.0M tokens | +24% / +4% / 1.02x |
+| gemma-4-31B | 15.5 tok/s | 116 tok/s | 1.10M tokens | +74% / +70% / 2.44x |
+| **gemma-4-26B-A4B** (default) | **61.6 tok/s** | **299 tok/s** | 4.58M tokens | +29% / +38% / 2.22x |
+| gemma-4-12b | 34.5 tok/s | 254 tok/s | 3.13M tokens | +60% / +49% / 1.86x |
+| gemma-4-E4B | 59.4 tok/s | 422 tok/s | 9.75M tokens | +36% / +17% / 2.13x |
+| gemma-4-E2B | 95.6 tok/s | 615 tok/s | 14.9M tokens | +21% / −2% / 1.05x |
+
+Every figure is within 2.5% of the v0.27 pre-release nightly measurement this table replaces (2026-07-28), and the 26B-A4B gave 61.0 / 291 tok/s on v0.29.0. The gains over one Spark are a few points smaller than that table showed (+74% against +80% on the 31B) because the single-Spark baseline rose, not because the cluster slowed.
 
 How much the second Spark buys tracks how starved the model was in the first place:
 
-- **The dense models gain most, and the biggest gains the most of all.** Decode on a dense model is memory-bandwidth-bound, and TP=2 splits every weight read across two memory systems: +80% single-stream on the 31B (8.8 → 15.8 tok/s), +62% on the 12b. The 31B also frees the most weight memory per node, which is why its KV capacity scales furthest (2.35x).
-- **The MoE gains a solid +34% / +41% through expert parallelism.** With only 3.8B active parameters it is far less bandwidth-starved than the dense models, so there is less for the cluster to reclaim — but at 62 tok/s single-stream and 4.54M tokens of KV cache it is still the model to serve, now with 2.1x the capacity.
-- **The E2B is the floor of the approach.** +24% single-stream, +4% aggregate — and its KV cache capacity does not grow at all (1.02x). That last one is architectural, not noise: the E2B has a single KV head (`num_key_value_heads: 1`), which TP=2 must replicate on both ranks, so each node still pays the full per-token KV cost and total capacity stays at one node's worth. The E4B's two KV heads split exactly, hence its 2.06x. Below ~4B effective parameters, the wire costs about what the second memory system pays back.
+- **The dense models gain most, and the biggest gains the most of all.** Decode on a dense model is memory-bandwidth-bound, and TP=2 splits every weight read across two memory systems: +74% single-stream on the 31B (8.9 → 15.5 tok/s), +60% on the 12b. The 31B also frees the most weight memory per node, which is why its KV capacity scales furthest (2.44x).
+- **The MoE gains +29% / +38% through expert parallelism.** With only 3.8B active parameters it is far less bandwidth-starved than the dense models, so there is less for the cluster to reclaim — but at 62 tok/s single-stream and 4.58M tokens of KV cache it is still the model to serve, now with 2.2x the capacity.
+- **The E2B is the floor of the approach.** +21% single-stream, −2% aggregate — and its KV cache capacity barely grows (1.05x). That last one is architectural, not noise: the E2B has a single KV head (`num_key_value_heads: 1`), which TP=2 must replicate on both ranks, so each node still pays the full per-token KV cost and total capacity stays at one node's worth. The E4B's two KV heads split exactly, hence its 2.13x. Below ~4B effective parameters, the wire costs about what the second memory system pays back.
 
 #### Speculative decoding on the cluster
 
-Same method again, with the drafters from the single-node setup (`num_speculative_tokens` 8 for DFlash, 2 for MTP) served via `run_cluster.sh serve <model> <dflash|mtp>`:
+Same method again, with the drafters from the single-node setup (`num_speculative_tokens` 8 for DFlash, 2 for MTP) served via `run_cluster.sh serve <model> <dflash|mtp>`, on v0.30.0:
 
 | Model + drafter | Baseline | With drafter | Single | Aggregate | Acceptance | KV cache |
 | --- | --- | --- | --- | --- | --- | --- |
-| gemma-4-31B + DFlash | 15.8 / 117 | **33.4 / 161** | +111% | +38% | 21.2% | 1.12M → 1.03M |
-| gemma-4-26B-A4B + DFlash | 62.1 / 297 | **75.9 / 287** | +22% | −3% | 15.6% | 4.54M → 4.06M |
-| gemma-4-12b + DFlash | 34.1 / 248 | **66.7 / 315** | +96% | +27% | 20.5% | 3.15M → 2.84M |
-| gemma-4-E4B + MTP | 58.7 / 422 | **70.9 / 443** | +21% | +5% | 22.9% | 9.81M → 9.76M |
-| gemma-4-E2B + MTP | 96.0 / 616 | **103.1 / 622** | +7% | +1% | 25.3% | 15.0M → 14.9M |
+| gemma-4-31B + DFlash | 15.5 / 116 | **33.5 / 167** | +116% | +44% | 21.5% | 1.10M → 973k |
+| gemma-4-31B + MTP | 15.5 / 116 | 28.2 / 179 | +82% | +55% | 53.6% | 1.10M → 1.06M |
+| gemma-4-26B-A4B + MTP † | 61.6 / 299 | **77.5 / 369** | +26% | +23% | 53.4% | 4.58M → 4.46M |
+| gemma-4-26B-A4B + DFlash † | 61.6 / 299 | 77.3 / 286 | +25% | −4% | 16.0% | 4.58M → 3.92M |
+| gemma-4-12b + DFlash | 34.5 / 254 | **61.8 / 296** | +79% | +17% | 18.2% | 3.13M → 2.74M |
+| gemma-4-12b + MTP | 34.5 / 254 | 55.6 / 378 | +61% | +49% | 53.4% | 3.13M → 3.02M |
+| gemma-4-E4B + MTP | 59.4 / 422 | **71.1 / 448** | +20% | +6% | 22.7% | 9.75M → 9.51M |
+| gemma-4-E2B + MTP | 95.6 / 615 | **108.2 / 645** | +13% | +5% | 25.4% | 14.9M → 14.6M |
 
-*single-stream tok/s / aggregate tok/s at 8 streams; baseline = cluster without a drafter.*
+*single-stream tok/s / aggregate tok/s at 8 streams; baseline = cluster without a drafter. † Does not start on stock v0.30.0; measured with two upstream fixes patched into the image (see below). Stock v0.29.0 runs 26B-A4B + DFlash at 75.6 / 294.*
 
-- **The cluster and the drafter stack almost perfectly multiplicatively.** Multiplying each model's single-Spark DFlash gain by its cluster gain predicts 34.5 / 66.0 / 75.0 tok/s for the 31B / 12b / 26B-A4B; measured is 33.4 / 66.7 / 75.9. The two levers attack independent bottlenecks — the drafter amortizes weight reads across draft tokens, TP=2 halves the reads per node — so neither eats the other's gain.
-- **The dense 31B at 33.4 tok/s is the flagship result**: 3.8x its single-Spark baseline (8.8), and past the point where its quality is usable interactively. The 12b with DFlash (66.7) now outruns even the MoE's cluster baseline (62.1).
-- **The E-series assistants work, and this is their first validation anywhere** — no DFlash drafters exist for E4B/E2B, so MTP is their only speculative option. Acceptance is modest (~0.5 of 2 drafted tokens) yet the E4B still nets +21% single-stream.
-- **The 26B-A4B cannot run MTP on the cluster, full stop.** Its NVFP4 experts force `--enable-expert-parallel` (see [Two-Spark cluster](#two-spark-cluster)), and the V2-runner MTP path builds the draft model's config with the parallel settings inherited — the dense assistant then fails validation with "Number of experts in the model must be greater than 0 when expert parallelism is enabled". Wedged between two constraints, the MoE's only cluster drafter is DFlash until upstream decouples the draft config; on the RTX (no EP needed) MTP remains its better drafter.
+- **On stock v0.30.0 the 26B-A4B cannot start with either drafter on the cluster.** Its NVFP4 experts force `--enable-expert-parallel` (see [Two-Spark cluster](#two-spark-cluster)), and v0.30.0 copies that flag into the dense drafter's parallel config. `serve 26b-a4b dflash` and `serve 26b-a4b mtp` both exit within a minute with `Number of experts in the model must be greater than 0 when expert parallelism is enabled`. vLLM fixed this on main in vllm-project/vllm#56930 (2026-09-17), after the v0.30.0 branch was cut. v0.29.0 doesn't have the bug, so DFlash runs there as-is: start the head and every worker with `VLLM_IMAGE=vllm/vllm-openai:v0.29.0`. MTP fails on v0.29.0 too, later in startup and with the same message. The Gemma 4 speculator rebuilds the draft's `VllmConfig` around the assistant's model config, and that config fails the same check (vllm-project/vllm#56936, still open). The † rows ran on v0.30.0 with both fixes patched in.
+- **With both fixes, MTP is the MoE's best drafter on the cluster too.** It matches DFlash single-stream (77.5 against 77.3 tok/s), delivers 29% more at 8 streams (369 against 286), and leaves more KV cache (4.46M tokens against 3.92M). Once a release carries both fixes, `serve 26b-a4b mtp` is the configuration to run.
+- **Drafter and cluster gains multiply only roughly, and MTP's shrink most.** Multiply a config's single-Spark drafter gain by the model's cluster gain and you get a prediction for this table. DFlash lands within ±9% of it: the 31B inside its range, the 26B-A4B 9% over, the 12b 7% under. MTP lands 7–21% under on every model, the E-series most: the E4B and E2B assistants are worth +46% and +43% on one Spark but +20% and +13% here. The earlier finding that the two stacked almost perfectly came from three DFlash configs on a v0.27 nightly.
+- **The dense 31B with DFlash at 33.5 tok/s is still the two-Spark flagship**: 3.8x its single-Spark baseline (8.9), and past the point where its quality is usable interactively. Four Sparks take it to 48.0 ([below](#4x-dgx-spark-tp4-cluster)). MTP gives up 16% single-stream on this model but wins at 8 streams (179 against 167).
+- **The other rows are within 5% of the v0.27 nightly** except the 12b + DFlash, 7% below its 66.7 tok/s there with acceptance down from 20.5% to 18.2%. On one Spark that drafter accepts 18.3% on both v0.29.0 and v0.30.0.
+
+### 4x DGX Spark (TP=4 cluster)
+
+The same script spans all four Sparks: run `worker` on each of the other three, then give `serve` the size, e.g. `./run_cluster.sh serve 31b dflash 4`. Same method, measured 2026-10-04 on v0.30.0, with the four Sparks on one 200 GbE network. The 26B-A4B runs expert parallelism across all four (32 experts per rank):
+
+| Model | Single-stream decode | Aggregate, 8 streams | KV cache capacity | vs TP=2 (single / agg / KV) | vs one Spark (single / agg / KV) |
+| --- | --- | --- | --- | --- | --- |
+| gemma-4-31B | 24.8 tok/s | 157 tok/s | 2.41M tokens | +60% / +35% / 2.18x | +179% / +131% / 5.32x |
+| **gemma-4-26B-A4B** (default) | **65.6 tok/s** | **298 tok/s** | 7.57M tokens | +6% / ±0% / 1.65x | +38% / +38% / 3.67x |
+| gemma-4-12b | 44.9 tok/s | 275 tok/s | 5.04M tokens | +30% / +8% / 1.61x | +109% / +61% / 2.99x |
+| gemma-4-E4B | 65.9 tok/s | 379 tok/s | 9.98M tokens | +11% / −10% / 1.02x | +50% / +5% / 2.18x |
+| gemma-4-E2B | 93.9 tok/s | 501 tok/s | 15.2M tokens | −2% / −19% / 1.02x | +19% / −20% / 1.07x |
+
+With drafters, served as `serve <model> <dflash|mtp> 4`:
+
+| Model + drafter | Baseline | With drafter | Single | Aggregate | Acceptance | KV cache | vs TP=2, same drafter |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| gemma-4-31B + DFlash | 24.8 / 157 | **48.0 / 198** | +94% | +27% | 21.8% | 2.41M → 2.14M | +43% / +19% |
+| gemma-4-31B + MTP | 24.8 / 157 | 39.8 / 221 | +60% | +41% | 53.1% | 2.41M → 2.31M | +41% / +23% |
+| gemma-4-26B-A4B + MTP † | 65.6 / 298 | **78.1 / 381** | +19% | +28% | 52.4% | 7.57M → 7.42M | +1% / +3% |
+| gemma-4-26B-A4B + DFlash † | 65.6 / 298 | 80.7 / 309 | +23% | +4% | 16.0% | 7.57M → 6.61M | +4% / +8% |
+| gemma-4-12b + DFlash | 44.9 / 275 | **71.3 / 306** | +59% | +11% | 18.2% | 5.04M → 4.51M | +15% / +3% |
+| gemma-4-12b + MTP | 44.9 / 275 | 62.4 / 370 | +39% | +34% | 51.7% | 5.04M → 4.91M | +12% / −2% |
+| gemma-4-E4B + MTP | 65.9 / 379 | 66.0 / 388 | ±0% | +2% | 23.1% | 9.98M → 9.75M | −7% / −13% |
+| gemma-4-E2B + MTP | 93.9 / 501 | 87.4 / 515 | −7% | +3% | 25.9% | 15.2M → 14.9M | −19% / −20% |
+
+*Single-stream / aggregate tok/s, as in the TP=2 table. † With the same two upstream fixes patched in; neither 26B-A4B drafter starts on stock v0.30.0.*
+
+- **The dense models keep scaling, by less with each doubling.** The 31B goes 8.9 → 15.5 → 24.8 tok/s single-stream from one Spark to two to four (+74%, then +60%), the 12b 21.5 → 34.5 → 44.9 (+60%, then +30%). At 8 streams the second doubling buys much less: +35% on the 31B and +8% on the 12b. Each doubling halves the weight reads per node, but every layer still ends in an all-reduce over the network, and that takes a growing share of each step, more so on the smaller model.
+- **The 31B with DFlash reaches 48.0 tok/s**, 5.4x its single-Spark baseline and 43% faster than on two Sparks. For scale, one RTX PRO 6000 runs the same config at 120 tok/s. MTP gives up 17% single-stream on this model and again wins at 8 streams (221 against 198 tok/s).
+- **The 26B-A4B has stopped scaling.** TP=4 adds 6% single-stream over TP=2 and nothing at 8 streams, and with a drafter it is 1–4% faster than on two Sparks. What the extra two Sparks buy the MoE is KV capacity, 7.57M tokens, not speed: one Spark with MTP already runs it at 65.8 tok/s, 16% short of four.
+- **On the 26B-A4B, DFlash now edges MTP single-stream** (80.7 against 78.1 tok/s), but MTP still delivers 23% more at 8 streams (381 against 309) and leaves more KV cache, so it remains the drafter to run once a release carries both fixes.
+- **The E-series runs better on two Sparks than on four.** The E4B gains 11% single-stream over TP=2 but loses 10% at 8 streams, and the E2B loses on both (−2% / −19%). With 2–4B effective parameters there is little work left per node to split, while every layer still waits on an all-reduce across four nodes. Their MTP assistants stop paying off as well: ±0% on the E4B and −7% on the E2B (86.5 tok/s on a second start), which leaves both 7–19% behind MTP on two Sparks. The fastest Spark setup for the E4B is two Sparks with MTP (71.1 tok/s), and for the E2B a single Spark with MTP (112.4). The E2B is also the one config here that wavered within a run: a second start held 94 tok/s for three of its eight runs, then sagged to 79–88.
+- **Drafter gains shrink again from TP=2 to TP=4.** On the 31B, DFlash is worth +94% here against +116% on two Sparks, and MTP +60% against +82%; the 12b's drafters drop the same way.
+- **KV capacity follows the models' global-attention KV heads.** The 31B's pool grows 2.18x over TP=2, more than the node count, because its four global KV heads split one per rank and each rank also holds a quarter of the weights. The 26B-A4B has two global KV heads and the 12b one, so every rank already stored one full head per global layer at TP=2 and still does at TP=4. Only their sliding-window layers split further, and their pools grow 1.65x and 1.61x. The E4B (two KV heads) and the E2B (one) were already at one head per rank at TP=2 and hold little weight memory to free, so their pools grow just 1.02x.
 
 ### Serving under concurrency
 
